@@ -65,14 +65,17 @@ import org.teavm.model.AnnotationReader;
 import org.teavm.model.AnnotationValue;
 import org.teavm.model.ClassReader;
 import org.teavm.model.ElementModifier;
+import org.teavm.model.FieldReference;
 import org.teavm.model.MethodReader;
 import org.teavm.model.MethodReference;
 import org.teavm.model.ValueType;
 import org.teavm.model.classes.VirtualTable;
 import org.teavm.runtime.Allocator;
 import org.teavm.runtime.ExceptionHandling;
+import org.teavm.runtime.Fiber;
 import org.teavm.runtime.RuntimeArray;
 import org.teavm.runtime.RuntimeClass;
+import org.teavm.runtime.RuntimeObject;
 
 public class CodeGenerationVisitor implements ExprVisitor, StatementVisitor {
     private static final MethodReference ALLOC_METHOD = new MethodReference(Allocator.class,
@@ -91,6 +94,8 @@ public class CodeGenerationVisitor implements ExprVisitor, StatementVisitor {
     private int[] maxTemporaryVariableLevel = new int[5];
     private MethodReference callingMethod;
     private Set<? super String> includes;
+    private int currentPart;
+    private boolean end;
 
     public CodeGenerationVisitor(GenerationContext context, CodeWriter writer, Set<? super String> includes) {
         this.context = context;
@@ -105,6 +110,14 @@ public class CodeGenerationVisitor implements ExprVisitor, StatementVisitor {
 
     public void setCallingMethod(MethodReference callingMethod) {
         this.callingMethod = callingMethod;
+    }
+
+    public void setCurrentPart(int currentPart) {
+        this.currentPart = currentPart;
+    }
+
+    public void setEnd(boolean end) {
+        this.end = end;
     }
 
     @Override
@@ -539,14 +552,27 @@ public class CodeGenerationVisitor implements ExprVisitor, StatementVisitor {
 
     @Override
     public void visit(QualificationExpr expr) {
+        FieldReference field = expr.getField();
+        if (isMonitorField(field)) {
+            writer.print("UNPACK_MONITOR(FIELD(");
+            expr.getQualified().acceptVisitor(this);
+            field = new FieldReference(RuntimeObject.class.getName(), "hashCode");
+            writer.print(", ").print(names.forClass(field.getClassName()) + ", "
+                    + names.forMemberField(field) + "))");
+            return;
+        }
+
         if (expr.getQualified() != null) {
             writer.print("FIELD(");
             expr.getQualified().acceptVisitor(this);
-            writer.print(", ").print(names.forClass(expr.getField().getClassName()) + ", "
-                    + names.forMemberField(expr.getField()) + ")");
+            writer.print(", ").print(names.forClass(field.getClassName()) + ", " + names.forMemberField(field) + ")");
         } else {
-            writer.print(names.forStaticField(expr.getField()));
+            writer.print(names.forStaticField(field));
         }
+    }
+
+    private boolean isMonitorField(FieldReference field) {
+        return field.getClassName().equals("java.lang.Object") && field.getFieldName().equals("monitor");
     }
 
     @Override
@@ -630,11 +656,30 @@ public class CodeGenerationVisitor implements ExprVisitor, StatementVisitor {
     @Override
     public void visit(AssignmentStatement statement) {
         if (statement.getLeftValue() != null) {
+            if (statement.getLeftValue() instanceof QualificationExpr) {
+                QualificationExpr qualification = (QualificationExpr) statement.getLeftValue();
+                FieldReference field = qualification.getField();
+                if (isMonitorField(field)) {
+                    writer.print("FIELD(");
+                    qualification.getQualified().acceptVisitor(this);
+                    field = new FieldReference(RuntimeObject.class.getName(), "hashCode");
+                    writer.print(", ").print(names.forClass(field.getClassName()) + ", "
+                            + names.forMemberField(field) + ") = PACK_MONITOR(");
+                    statement.getRightValue().acceptVisitor(this);
+                    writer.println(");");
+                    return;
+                }
+            }
+
             statement.getLeftValue().acceptVisitor(this);
             writer.print(" = ");
         }
         statement.getRightValue().acceptVisitor(this);
         writer.println(";");
+
+        if (statement.isAsync()) {
+            emitSuspendChecker();
+        }
     }
 
     @Override
@@ -643,9 +688,17 @@ public class CodeGenerationVisitor implements ExprVisitor, StatementVisitor {
     }
 
     private void visitMany(List<Statement> statements) {
-        for (Statement statement : statements) {
-            statement.acceptVisitor(this);
+        if (statements.isEmpty()) {
+            return;
         }
+        boolean oldEnd = end;
+        for (int i = 0; i < statements.size() - 1; ++i) {
+            end = false;
+            statements.get(i).acceptVisitor(this);
+        }
+        end = oldEnd;
+        statements.get(statements.size() - 1).acceptVisitor(this);
+        end = oldEnd;
     }
 
     @Override
@@ -688,8 +741,12 @@ public class CodeGenerationVisitor implements ExprVisitor, StatementVisitor {
             }
 
             writer.indent();
-            visitMany(clause.getBody());
-            writer.println("break;");
+            boolean oldEnd = end;
+            for (Statement part : clause.getBody()) {
+                end = false;
+                part.acceptVisitor(this);
+            }
+            end = oldEnd;
             writer.outdent();
         }
 
@@ -716,7 +773,12 @@ public class CodeGenerationVisitor implements ExprVisitor, StatementVisitor {
         }
         writer.println(") {").indent();
 
-        visitMany(statement.getBody());
+        boolean oldEnd = end;
+        for (Statement part : statement.getBody()) {
+            end = false;
+            part.acceptVisitor(this);
+        }
+        end = oldEnd;
 
         if (statement.getId() != null) {
             writer.outdent().println("cnt_" + statement.getId() + ":;").indent();
@@ -779,11 +841,16 @@ public class CodeGenerationVisitor implements ExprVisitor, StatementVisitor {
 
     @Override
     public void visit(TryCatchStatement statement) {
-
     }
 
     @Override
     public void visit(GotoPartStatement statement) {
+        if (statement.getPart() != currentPart) {
+            writer.println("ptr = " + statement.getPart() + ";");
+        }
+        if (!end || statement.getPart() != currentPart + 1) {
+            writer.println("goto next_state;");
+        }
     }
 
     @Override
@@ -792,6 +859,11 @@ public class CodeGenerationVisitor implements ExprVisitor, StatementVisitor {
 
     @Override
     public void visit(MonitorExitStatement statement) {
+    }
+
+    public void emitSuspendChecker() {
+        String suspendingName = names.forMethod(new MethodReference(Fiber.class, "isSuspending", boolean.class));
+        writer.println("if (" + suspendingName + "(fiber)) goto exit_loop;");
     }
 
     private IntrinsicContext intrinsicContext = new IntrinsicContext() {
