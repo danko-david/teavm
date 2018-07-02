@@ -15,12 +15,10 @@
  */
 package org.teavm.dependency;
 
-import com.carrotsearch.hppc.IntHashSet;
-import com.carrotsearch.hppc.IntSet;
-import com.carrotsearch.hppc.cursors.IntCursor;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.Deque;
 import java.util.HashMap;
@@ -60,7 +58,6 @@ import org.teavm.model.util.ProgramUtils;
 import org.teavm.parsing.Parser;
 
 public class DependencyAnalyzer implements DependencyInfo {
-    private static final int PROPAGATION_STACK_THRESHOLD = 50;
     static final boolean shouldLog = System.getProperty("org.teavm.logDependencies", "false").equals("true");
     static final boolean shouldTag = System.getProperty("org.teavm.tagDependencies", "false").equals("true")
             || shouldLog;
@@ -75,7 +72,6 @@ public class DependencyAnalyzer implements DependencyInfo {
     private CachedMapper<String, ClassDependency> classCache;
     private List<DependencyListener> listeners = new ArrayList<>();
     private ServiceRepository services;
-    private Deque<DependencyNodeToNodeTransition> pendingTransitions = new ArrayDeque<>();
     private Deque<Runnable> tasks = new ArrayDeque<>();
     private Queue<Runnable> deferredTasks = new ArrayDeque<>();
     List<DependencyType> types = new ArrayList<>();
@@ -90,6 +86,8 @@ public class DependencyAnalyzer implements DependencyInfo {
     private boolean completing;
     private Map<String, SuperClassFilter> superClassFilters = new HashMap<>();
     boolean asyncSupported;
+    private List<DependencyNode> allNodes = new ArrayList<>();
+    private List<DependencyNode> sortedNodes = new ArrayList<>();
 
     public DependencyAnalyzer(ClassReaderSource classSource, ClassLoader classLoader, ServiceRepository services,
             Diagnostics diagnostics) {
@@ -127,10 +125,6 @@ public class DependencyAnalyzer implements DependencyInfo {
         return agent;
     }
 
-    public DependencyAnalyzerInterruptor getInterruptor() {
-        return interruptor;
-    }
-
     public void setInterruptor(DependencyAnalyzerInterruptor interruptor) {
         this.interruptor = interruptor;
     }
@@ -153,8 +147,10 @@ public class DependencyAnalyzer implements DependencyInfo {
         return createNode(null);
     }
 
-    private DependencyNode createNode(ValueType typeFilter) {
-        return new DependencyNode(this, typeFilter);
+    DependencyNode createNode(ValueType typeFilter) {
+        DependencyNode node = new DependencyNode(this, typeFilter);
+        allNodes.add(node);
+        return node;
     }
 
     @Override
@@ -239,44 +235,12 @@ public class DependencyAnalyzer implements DependencyInfo {
         classSource.addTransformer(transformer);
     }
 
-    public void addEntryPoint(MethodReference methodRef, String... argumentTypes) {
-        ValueType[] parameters = methodRef.getDescriptor().getParameterTypes();
-        if (parameters.length + 1 != argumentTypes.length) {
-            throw new IllegalArgumentException("argumentTypes length does not match the number of method's arguments");
-        }
-        MethodDependency method = linkMethod(methodRef, null);
-        method.use();
-        DependencyNode[] varNodes = method.getVariables();
-        varNodes[0].propagate(getType(methodRef.getClassName()));
-        for (int i = 0; i < argumentTypes.length; ++i) {
-            varNodes[i + 1].propagate(getType(argumentTypes[i]));
-        }
+    private void schedulePropagation(DependencyConsumer consumer, DependencyType type) {
+        tasks.add(() -> consumer.consume(type));
     }
 
-    private int propagationDepth;
-
-    void schedulePropagation(DependencyConsumer consumer, DependencyType type) {
-        if (propagationDepth < PROPAGATION_STACK_THRESHOLD) {
-            ++propagationDepth;
-            consumer.consume(type);
-            --propagationDepth;
-        } else {
-            tasks.add(() -> consumer.consume(type));
-        }
-    }
-
-    void schedulePropagation(DependencyNodeToNodeTransition consumer, DependencyType type) {
-        if (consumer.pendingTypes == null && propagationDepth < PROPAGATION_STACK_THRESHOLD) {
-            ++propagationDepth;
-            consumer.consume(type);
-            --propagationDepth;
-        } else {
-            if (consumer.pendingTypes == null) {
-                pendingTransitions.add(consumer);
-                consumer.pendingTypes = new IntHashSet();
-            }
-            consumer.pendingTypes.add(type.index);
-        }
+    private void schedulePropagation(DependencyNodeToNodeTransition consumer, DependencyType type) {
+        tasks.add(() -> consumer.consume(type));
     }
 
     void schedulePropagation(DependencyNodeToNodeTransition consumer, DependencyType[] types) {
@@ -288,19 +252,7 @@ public class DependencyAnalyzer implements DependencyInfo {
             return;
         }
 
-        if (consumer.pendingTypes == null && propagationDepth < PROPAGATION_STACK_THRESHOLD) {
-            ++propagationDepth;
-            consumer.consume(types);
-            --propagationDepth;
-        } else {
-            if (consumer.pendingTypes == null) {
-                pendingTransitions.add(consumer);
-                consumer.pendingTypes = new IntHashSet();
-            }
-            for (DependencyType type : types) {
-                consumer.pendingTypes.add(type.index);
-            }
-        }
+        tasks.add(() -> consumer.consume(types));
     }
 
     void schedulePropagation(DependencyConsumer consumer, DependencyType[] types) {
@@ -312,19 +264,11 @@ public class DependencyAnalyzer implements DependencyInfo {
             return;
         }
 
-        if (propagationDepth < PROPAGATION_STACK_THRESHOLD) {
-            ++propagationDepth;
+        tasks.add(() -> {
             for (DependencyType type : types) {
                 consumer.consume(type);
             }
-            --propagationDepth;
-        } else {
-            tasks.add(() -> {
-                for (DependencyType type : types) {
-                    consumer.consume(type);
-                }
-            });
-        }
+        });
     }
 
     private Set<String> classesAddedByRoot = new HashSet<>();
@@ -585,46 +529,98 @@ public class DependencyAnalyzer implements DependencyInfo {
             return;
         }
         int index = 0;
-        while (!deferredTasks.isEmpty() || !tasks.isEmpty() || !pendingTransitions.isEmpty()) {
+        do {
+            while (!deferredTasks.isEmpty()) {
+                deferredTasks.remove().run();
+            }
+
             while (true) {
-                processNodeToNodeTransitionQueue();
-                if (tasks.isEmpty()) {
-                    break;
+                while (!tasks.isEmpty()) {
+                    tasks.remove().run();
                 }
-                tasks.remove().run();
-                if (++index == 100) {
+                if (++index == 1000) {
                     if (interruptor != null && !interruptor.shouldContinue()) {
                         interrupted = true;
                         break;
                     }
                     index = 0;
                 }
-            }
 
-            propagationDepth = PROPAGATION_STACK_THRESHOLD;
-            while (!deferredTasks.isEmpty()) {
-                deferredTasks.remove().run();
+                processNodeToNodeTransitionQueue();
+
+                if (tasks.isEmpty()) {
+                    break;
+                }
             }
-            propagationDepth = 0;
-        }
+        } while (!deferredTasks.isEmpty() || !tasks.isEmpty());
     }
 
     private void processNodeToNodeTransitionQueue() {
-        while (!pendingTransitions.isEmpty()) {
-            DependencyNodeToNodeTransition transition = pendingTransitions.remove();
-            IntSet pendingTypes = transition.pendingTypes;
-            transition.pendingTypes = null;
-            if (pendingTypes.size() == 1) {
-                DependencyType type = types.get(pendingTypes.iterator().next().value);
-                transition.consume(type);
-            } else {
-                DependencyType[] typesToPropagate = new DependencyType[pendingTypes.size()];
-                int index = 0;
-                for (IntCursor cursor : pendingTypes) {
-                    typesToPropagate[index++] = types.get(cursor.value);
+        List<DependencyNodeToNodeTransition> backEdges = new ArrayList<>();
+        sortNodes(backEdges);
+
+        boolean hasChanges;
+        do {
+            hasChanges = false;
+
+            boolean hasForwardChanges = false;
+            for (DependencyNode node : sortedNodes) {
+                if (node.inputTransitions == null) {
+                    continue;
                 }
-                transition.consume(typesToPropagate);
+                for (DependencyNodeToNodeTransition transition : node.inputTransitions) {
+                    if (transition.source.index < transition.destination.index && transition.propagatePendingTypes()) {
+                        hasForwardChanges = true;
+                        hasChanges = true;
+                    }
+                }
             }
+
+            if (hasForwardChanges) {
+                for (DependencyNodeToNodeTransition transition : backEdges) {
+                    if (transition.propagatePendingTypes()) {
+                        hasChanges = true;
+                    }
+                }
+            }
+        } while (hasChanges);
+
+        for (DependencyNode node : sortedNodes) {
+            node.applyPendingTypes();
+        }
+    }
+
+    private void sortNodes(List<DependencyNodeToNodeTransition> backEdges) {
+        sortedNodes.clear();
+        Deque<DependencyNode> stack = new ArrayDeque<>(allNodes);
+        for (DependencyNode node : allNodes) {
+            node.state = 0;
+        }
+
+        while (!stack.isEmpty()) {
+            DependencyNode node = stack.pop();
+            if (node.state == 0) {
+                node.state = 1;
+                stack.push(node);
+                if (node.transitions != null) {
+                    for (DependencyNodeToNodeTransition transition : node.transitions) {
+                        DependencyNode dest = transition.destination;
+                        if (dest.state == 0) {
+                            stack.push(dest);
+                        } else if (dest.state == 1) {
+                            backEdges.add(transition);
+                        }
+                    }
+                }
+            } else if (node.state == 1) {
+                sortedNodes.add(node);
+                node.state = 2;
+            }
+        }
+
+        Collections.reverse(sortedNodes);
+        for (int i = 0; i < sortedNodes.size(); ++i) {
+            sortedNodes.get(i).index = i;
         }
     }
 

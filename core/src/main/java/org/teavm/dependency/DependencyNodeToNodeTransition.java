@@ -15,16 +15,15 @@
  */
 package org.teavm.dependency;
 
-import com.carrotsearch.hppc.IntSet;
-import java.util.Arrays;
+import com.carrotsearch.hppc.IntHashSet;
+import com.carrotsearch.hppc.cursors.IntCursor;
 import java.util.BitSet;
 
 class DependencyNodeToNodeTransition implements DependencyConsumer {
-    private DependencyNode source;
+    DependencyNode source;
     DependencyNode destination;
     private DependencyTypeFilter filter;
     private BitSet knownFilteredOffTypes;
-    IntSet pendingTypes;
 
     DependencyNodeToNodeTransition(DependencyNode source, DependencyNode destination, DependencyTypeFilter filter) {
         this.source = source;
@@ -44,22 +43,11 @@ class DependencyNodeToNodeTransition implements DependencyConsumer {
         if (type.getName().equals("java.lang.Class")) {
             source.getClassValueNode().connect(destination.getClassValueNode());
         }
-        if (!destination.hasType(type)) {
-            destination.propagate(type);
-        }
     }
 
     void consume(DependencyType[] types) {
-        int j = 0;
-        boolean copied = false;
         for (DependencyType type : types) {
-            boolean added = false;
             if (filterType(type)) {
-                if (!destination.hasType(type)) {
-                    types[j++] = type;
-                    added = true;
-                }
-
                 if (type.getName().startsWith("[")) {
                     source.getArrayItem().connect(destination.getArrayItem());
                     destination.getArrayItem().connect(source.getArrayItem());
@@ -68,24 +56,6 @@ class DependencyNodeToNodeTransition implements DependencyConsumer {
                     source.getClassValueNode().connect(destination.getClassValueNode());
                 }
             }
-            if (!added && !copied) {
-                copied = true;
-                types = types.clone();
-            }
-        }
-
-        if (j == 0) {
-            return;
-        }
-
-        if (j == 1) {
-            destination.propagate(types[0]);
-        } else {
-            if (j < types.length) {
-                types = Arrays.copyOf(types, j);
-            }
-
-            destination.propagate(types);
         }
     }
 
@@ -106,5 +76,24 @@ class DependencyNodeToNodeTransition implements DependencyConsumer {
         }
 
         return true;
+    }
+
+    boolean propagatePendingTypes() {
+        if (source.pendingTypes == null) {
+            return false;
+        }
+        if (destination.pendingTypes == null) {
+            destination.pendingTypes = new IntHashSet();
+        }
+        boolean hasAny = false;
+        for (IntCursor cursor : source.pendingTypes) {
+            DependencyType type = source.dependencyAnalyzer.types.get(cursor.value);
+            if (!destination.hasType(type) && !destination.pendingTypes.contains(cursor.value) && filterType(type)
+                    && destination.filter(type)) {
+                destination.pendingTypes.add(cursor.value);
+                hasAny = true;
+            }
+        }
+        return hasAny;
     }
 }
