@@ -192,6 +192,9 @@ public class TClass<T> extends TObject implements TAnnotatedElement {
             initReflection();
             JSClass jsClass = (JSClass) getPlatformClass().getMetadata();
             JSArray<JSField> jsFields = jsClass.getFields();
+            if (jsFields == null) {
+                jsFields = JSArray.create();
+            }
             declaredFields = new TField[jsFields.getLength()];
             for (int i = 0; i < jsFields.getLength(); ++i) {
                 JSField jsField = jsFields.get(i);
@@ -383,6 +386,9 @@ public class TClass<T> extends TObject implements TAnnotatedElement {
             initReflection();
             JSClass jsClass = (JSClass) getPlatformClass().getMetadata();
             JSArray<JSMethodMember> jsMethods = jsClass.getMethods();
+            if (jsMethods == null) {
+                jsMethods = JSArray.create();
+            }
             declaredMethods = new TMethod[jsMethods.getLength()];
             int count = 0;
             for (int i = 0; i < jsMethods.getLength(); ++i) {
