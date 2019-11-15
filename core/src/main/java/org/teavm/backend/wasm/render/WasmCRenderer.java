@@ -72,8 +72,6 @@ public class WasmCRenderer {
         line("");
 
         renderFunctionDeclarations(module);
-        line("static int8_t *wasm_heap;");
-        line("static int32_t wasm_heap_size;");
         renderFunctionTable(module);
 
         for (WasmFunction function : module.getFunctions().values()) {
@@ -117,8 +115,8 @@ public class WasmCRenderer {
     }
 
     private void renderHeap(WasmModule module) {
-        line("wasm_heap_size = " + 65536 * module.getMemorySize() + ";");
-        line("wasm_heap = malloc(" + 65536 * module.getMemorySize() + ");");
+        line("wasm_heap_size = " + 65536 * module.getMinMemorySize() + ";");
+        line("wasm_heap = malloc(wasm_heap_size);");
         for (WasmMemorySegment segment : module.getSegments()) {
             line("memcpy(wasm_heap + " + segment.getOffset() + ",");
             indent();
@@ -174,7 +172,8 @@ public class WasmCRenderer {
         renderFunctionModifiers(declaration, function);
         declaration.append(WasmCRenderingVisitor.mapType(function.getResult())).append(' ');
         declaration.append(function.getName()).append('(');
-        for (int i = 0; i < function.getParameters().size(); ++i) {
+        int sz = Math.min(function.getParameters().size(), function.getLocalVariables().size());
+        for (int i = 0; i < sz; ++i) {
             if (i > 0) {
                 declaration.append(", ");
             }
@@ -186,8 +185,7 @@ public class WasmCRenderer {
         line(declaration.toString());
         indent();
 
-        List<WasmLocal> variables = function.getLocalVariables().subList(function.getParameters().size(),
-                function.getLocalVariables().size());
+        List<WasmLocal> variables = function.getLocalVariables().subList(sz, function.getLocalVariables().size());
         for (WasmLocal variable : variables) {
             line(WasmCRenderingVisitor.mapType(variable.getType()) + " " + visitor.getVariableName(variable) + ";");
         }

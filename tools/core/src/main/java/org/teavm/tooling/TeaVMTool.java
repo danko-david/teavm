@@ -33,6 +33,7 @@ import java.util.List;
 import java.util.Properties;
 import java.util.Set;
 import org.teavm.backend.c.CTarget;
+import org.teavm.backend.c.generate.CNameProvider;
 import org.teavm.backend.javascript.JavaScriptTarget;
 import org.teavm.backend.wasm.WasmTarget;
 import org.teavm.backend.wasm.render.WasmBinaryVersion;
@@ -101,8 +102,11 @@ public class TeaVMTool {
     private WasmBinaryVersion wasmVersion = WasmBinaryVersion.V_0x1;
     private CTarget cTarget;
     private Set<File> generatedFiles = new HashSet<>();
-    private int minHeapSize = 32 * (1 << 20);
+    private int minHeapSize = 4 * (1 << 20);
+    private int maxHeapSize = 128 * (1 << 20);
     private ReferenceCache referenceCache;
+    private boolean longjmpSupported = true;
+    private boolean heapDump;
 
     public File getTargetDirectory() {
         return targetDirectory;
@@ -232,6 +236,10 @@ public class TeaVMTool {
         this.minHeapSize = minHeapSize;
     }
 
+    public void setMaxHeapSize(int maxHeapSize) {
+        this.maxHeapSize = maxHeapSize;
+    }
+
     public ClassLoader getClassLoader() {
         return classLoader;
     }
@@ -246,6 +254,14 @@ public class TeaVMTool {
 
     public void setWasmVersion(WasmBinaryVersion wasmVersion) {
         this.wasmVersion = wasmVersion;
+    }
+
+    public void setLongjmpSupported(boolean longjmpSupported) {
+        this.longjmpSupported = longjmpSupported;
+    }
+
+    public void setHeapDump(boolean heapDump) {
+        this.heapDump = heapDump;
     }
 
     public void setProgressListener(TeaVMProgressListener progressListener) {
@@ -315,13 +331,18 @@ public class TeaVMTool {
         webAssemblyTarget.setWastEmitted(debugInformationGenerated);
         webAssemblyTarget.setVersion(wasmVersion);
         webAssemblyTarget.setMinHeapSize(minHeapSize);
+        webAssemblyTarget.setMinHeapSize(maxHeapSize);
         return webAssemblyTarget;
     }
 
     private CTarget prepareCTarget() {
-        cTarget = new CTarget();
+        cTarget = new CTarget(new CNameProvider());
         cTarget.setMinHeapSize(minHeapSize);
+        cTarget.setMaxHeapSize(maxHeapSize);
         cTarget.setLineNumbersGenerated(debugInformationGenerated);
+        cTarget.setLongjmpUsed(longjmpSupported);
+        cTarget.setHeapDump(heapDump);
+        cTarget.setObfuscated(minifying);
         return cTarget;
     }
 
@@ -345,7 +366,7 @@ public class TeaVMTool {
                         fileTable, variableTable, classSource, innerClassSource);
                 programCache = new DiskProgramCache(cacheDirectory, referenceCache, symbolTable, fileTable,
                         variableTable);
-                if (incremental && targetType == TeaVMTargetType.JAVASCRIPT) {
+                if (targetType == TeaVMTargetType.JAVASCRIPT) {
                     astCache = new DiskMethodNodeCache(cacheDirectory, referenceCache, symbolTable, fileTable,
                             variableTable);
                     javaScriptTarget.setAstCache(astCache);
@@ -389,7 +410,7 @@ public class TeaVMTool {
                 vm.add(transformer);
             }
             if (mainClass != null) {
-                vm.entryPoint(mainClass, entryPointName);
+                vm.entryPoint(mainClass, entryPointName != null ? entryPointName : "main");
             }
             for (String className : classesToPreserve) {
                 vm.preserveType(className);

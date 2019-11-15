@@ -24,6 +24,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
+import org.teavm.backend.lowlevel.generate.NameProvider;
 import org.teavm.backend.wasm.binary.BinaryWriter;
 import org.teavm.backend.wasm.binary.DataArray;
 import org.teavm.backend.wasm.binary.DataPrimitives;
@@ -71,8 +72,11 @@ public class WasmClassGenerator {
             DataPrimitives.INT, /* tag */
             DataPrimitives.INT, /* canary */
             DataPrimitives.ADDRESS, /* name */
+            DataPrimitives.ADDRESS, /* name cache */
             DataPrimitives.ADDRESS, /* item type */
             DataPrimitives.ADDRESS, /* array type */
+            DataPrimitives.ADDRESS, /* declaring class */
+            DataPrimitives.ADDRESS, /* enclosing class */
             DataPrimitives.INT, /* isInstance function */
             DataPrimitives.INT, /* init function */
             DataPrimitives.ADDRESS, /* parent */
@@ -80,23 +84,29 @@ public class WasmClassGenerator {
             DataPrimitives.ADDRESS, /* interfaces */
             DataPrimitives.ADDRESS, /* enum values */
             DataPrimitives.ADDRESS, /* layout */
-            DataPrimitives.ADDRESS  /* simple name */);
+            DataPrimitives.ADDRESS,  /* simple name */
+            DataPrimitives.ADDRESS,  /* simple name cache */
+            DataPrimitives.ADDRESS   /* canonical name cache */);
     private IntegerArray staticGcRoots = new IntegerArray(1);
     private int staticGcRootsAddress;
+    private int classesAddress;
+    private int classCount;
 
     private static final int CLASS_SIZE = 1;
     private static final int CLASS_FLAGS = 2;
     private static final int CLASS_TAG = 3;
     private static final int CLASS_CANARY = 4;
     private static final int CLASS_NAME = 5;
-    private static final int CLASS_ITEM_TYPE = 6;
-    private static final int CLASS_ARRAY_TYPE = 7;
-    private static final int CLASS_IS_INSTANCE = 8;
-    private static final int CLASS_INIT = 9;
-    private static final int CLASS_PARENT = 10;
-    private static final int CLASS_ENUM_VALUES = 13;
-    private static final int CLASS_LAYOUT = 14;
-    private static final int CLASS_SIMPLE_NAME = 15;
+    private static final int CLASS_ITEM_TYPE = 7;
+    private static final int CLASS_ARRAY_TYPE = 8;
+    private static final int CLASS_DECLARING_CLASS = 9;
+    private static final int CLASS_ENCLOSING_CLASS = 10;
+    private static final int CLASS_IS_INSTANCE = 11;
+    private static final int CLASS_INIT = 12;
+    private static final int CLASS_PARENT = 13;
+    private static final int CLASS_ENUM_VALUES = 16;
+    private static final int CLASS_LAYOUT = 17;
+    private static final int CLASS_SIMPLE_NAME = 18;
 
     public WasmClassGenerator(ClassReaderSource processedClassSource, ClassReaderSource classSource,
             VirtualTableProvider vtableProvider, TagRegistry tagRegistry, BinaryWriter binaryWriter,
@@ -274,6 +284,22 @@ public class WasmClassGenerator {
         functionTable.add(names.forSupertypeFunction(ValueType.object(name)));
         header.setAddress(CLASS_PARENT, parentPtr);
 
+        ClassReader cls = processedClassSource.get(name);
+
+        if (cls != null) {
+            if (cls.getSimpleName() != null) {
+                header.setAddress(CLASS_SIMPLE_NAME, stringPool.getStringPointer(cls.getSimpleName()));
+            }
+
+            if (cls.getOwnerName() != null && processedClassSource.get(cls.getOwnerName()) != null) {
+                header.setAddress(CLASS_ENCLOSING_CLASS, getClassPointer(ValueType.object(cls.getOwnerName())));
+            }
+            if (cls.getDeclaringClassName() != null && processedClassSource.get(cls.getDeclaringClassName()) != null) {
+                header.setAddress(CLASS_DECLARING_CLASS,
+                        getClassPointer(ValueType.object(cls.getDeclaringClassName())));
+            }
+        }
+
         if (vtable != null) {
             fillVirtualTable(vtable, array);
         }
@@ -295,10 +321,14 @@ public class WasmClassGenerator {
             staticGcRoots.add(binaryData.fieldLayout.get(field.getFieldName()));
         }
 
-        ClassReader cls = processedClassSource.get(name);
-        if (cls != null && cls.hasModifier(ElementModifier.ENUM)) {
-            header.setAddress(CLASS_ENUM_VALUES, generateEnumValues(cls, binaryData));
-            flags |= RuntimeClass.ENUM;
+        if (cls != null) {
+            if (cls.hasModifier(ElementModifier.ENUM)) {
+                header.setAddress(CLASS_ENUM_VALUES, generateEnumValues(cls, binaryData));
+                flags |= RuntimeClass.ENUM;
+            }
+            if (cls.hasModifier(ElementModifier.SYNTHETIC)) {
+                flags |= RuntimeClass.SYNTHETIC;
+            }
         }
 
         if (cls != null && binaryData.start >= 0
@@ -310,7 +340,6 @@ public class WasmClassGenerator {
         }
 
         header.setInt(CLASS_FLAGS, flags);
-        header.setAddress(CLASS_SIMPLE_NAME, 0);
 
         return vtable != null ? wrapper : header;
     }
@@ -592,10 +621,19 @@ public class WasmClassGenerator {
             }
         }
         writeStaticGcRoots();
+        writeClasses();
     }
 
     public int getStaticGcRootsAddress() {
         return staticGcRootsAddress;
+    }
+
+    public int getClassesAddress() {
+        return classesAddress;
+    }
+
+    public int getClassCount() {
+        return classCount;
     }
 
     private void writeStaticGcRoots() {
@@ -606,6 +644,21 @@ public class WasmClassGenerator {
             DataValue value = DataPrimitives.ADDRESS.createValue();
             value.setAddress(0, gcRoot);
             binaryWriter.append(value);
+        }
+    }
+
+    private void writeClasses() {
+        for (ClassBinaryData cls : binaryDataMap.values()) {
+            if (cls.start < 0) {
+                continue;
+            }
+            DataValue value = DataPrimitives.ADDRESS.createValue();
+            value.setAddress(0, cls.start);
+            int address = binaryWriter.append(value);
+            if (classesAddress == 0) {
+                classesAddress = address;
+            }
+            ++classCount;
         }
     }
 
@@ -620,7 +673,7 @@ public class WasmClassGenerator {
         return cls.getMethod(new MethodDescriptor("<clinit>", ValueType.VOID)) != null;
     }
 
-    private class ClassBinaryData {
+    static class ClassBinaryData {
         ValueType type;
         int size;
         int alignment;

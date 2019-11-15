@@ -37,6 +37,7 @@ import org.teavm.model.ClassHierarchy;
 import org.teavm.model.ClassReader;
 import org.teavm.model.ElementModifier;
 import org.teavm.model.Incoming;
+import org.teavm.model.InliningInfo;
 import org.teavm.model.Instruction;
 import org.teavm.model.ListableClassReaderSource;
 import org.teavm.model.MethodReader;
@@ -44,6 +45,7 @@ import org.teavm.model.MethodReference;
 import org.teavm.model.Phi;
 import org.teavm.model.Program;
 import org.teavm.model.ProgramReader;
+import org.teavm.model.TextLocation;
 import org.teavm.model.TryCatchBlock;
 import org.teavm.model.VariableReader;
 import org.teavm.model.analysis.ClassInference;
@@ -69,15 +71,18 @@ public class Inlining {
     private MethodUsageCounter usageCounter;
     private Set<MethodReference> methodsUsedOnce = new HashSet<>();
     private boolean devirtualization;
+    private ClassInference classInference;
+    private InliningFilterFactory filterFactory;
 
     public Inlining(ClassHierarchy hierarchy, DependencyInfo dependencyInfo, InliningStrategy strategy,
             ListableClassReaderSource classes, Predicate<MethodReference> externalMethods,
-            boolean devirtualization) {
+            boolean devirtualization, InliningFilterFactory filterFactory) {
         this.hierarchy = hierarchy;
         this.classes = classes;
         this.dependencyInfo = dependencyInfo;
         this.strategy = strategy;
         this.devirtualization = devirtualization;
+        this.filterFactory = filterFactory;
         usageCounter = new MethodUsageCounter(externalMethods);
 
         for (String className : classes.getClassNames()) {
@@ -177,7 +182,7 @@ public class Inlining {
         if (step == null) {
             return false;
         }
-        List<PlanEntry> plan = buildPlan(program, -1, step, method);
+        List<PlanEntry> plan = buildPlan(program, -1, step, method, null);
         if (plan.isEmpty()) {
             return false;
         }
@@ -226,6 +231,8 @@ public class Inlining {
         jumpToInlinedProgram.setTarget(firstInlineBlock);
         block.add(jumpToInlinedProgram);
 
+        InliningInfoMerger inliningInfoMerger = new InliningInfoMerger(planEntry.locationInfo);
+
         for (int i = 0; i < inlineProgram.basicBlockCount(); ++i) {
             BasicBlock blockToInline = inlineProgram.basicBlockAt(i);
             BasicBlock inlineBlock = program.basicBlockAt(firstInlineBlock.getIndex() + i);
@@ -243,6 +250,14 @@ public class Inlining {
                         }
                     }
                 }
+
+                TextLocation location = insn.getLocation();
+                if (location == null) {
+                    location = TextLocation.EMPTY;
+                }
+                location = new TextLocation(location.getFileName(), location.getLine(),
+                        inliningInfoMerger.merge(location.getInlining()));
+                insn.setLocation(location);
             }
 
             List<Phi> phis = new ArrayList<>(blockToInline.getPhis());
@@ -323,9 +338,11 @@ public class Inlining {
         execPlan(program, planEntry.innerPlan, firstInlineBlock.getIndex());
     }
 
-    private List<PlanEntry> buildPlan(Program program, int depth, InliningStep step, MethodReference method) {
+    private List<PlanEntry> buildPlan(Program program, int depth, InliningStep step, MethodReference method,
+            InliningInfo inliningInfo) {
         List<PlanEntry> plan = new ArrayList<>();
         int originalDepth = depth;
+        InliningFilter filter = filterFactory.createFilter(method);
 
         ContextImpl context = new ContextImpl();
         for (BasicBlock block : program.getBasicBlocks()) {
@@ -354,6 +371,9 @@ public class Inlining {
                         != method.getClassName().equals(Fiber.class.getName())) {
                     continue;
                 }
+                if (!filter.apply(invoke.getMethod())) {
+                    continue;
+                }
 
                 MethodReader invokedMethod = getMethod(invoke.getMethod());
                 if (invokedMethod == null || invokedMethod.getProgram() == null
@@ -372,13 +392,22 @@ public class Inlining {
                 }
                 Program invokedProgram = ProgramUtils.copy(invokedMethod.getProgram());
 
+                TextLocation location = insn.getLocation();
+                InliningInfo innerInliningInfo = new InliningInfo(
+                        invoke.getMethod(),
+                        location != null ? location.getFileName() : null,
+                        location != null ? location.getLine() : -1,
+                        inliningInfo);
+
                 PlanEntry entry = new PlanEntry();
                 entry.targetBlock = block.getIndex();
                 entry.targetInstruction = insn;
                 entry.program = invokedProgram;
-                entry.innerPlan.addAll(buildPlan(invokedProgram, depth + 1, innerStep, invokedMethod.getReference()));
+                entry.innerPlan.addAll(buildPlan(invokedProgram, depth + 1, innerStep, invokedMethod.getReference(),
+                        innerInliningInfo));
                 entry.depth = depth;
                 entry.method = invokedMethod.getReference();
+                entry.locationInfo = innerInliningInfo;
                 plan.add(entry);
             }
         }
@@ -393,8 +422,10 @@ public class Inlining {
     }
 
     private void devirtualize(Program program, MethodReference method, DependencyInfo dependencyInfo) {
-        ClassInference inference = new ClassInference(dependencyInfo, hierarchy);
-        inference.infer(program, method);
+        if (classInference == null) {
+            classInference = new ClassInference(dependencyInfo, hierarchy, classes.getClassNames(), 30);
+        }
+        classInference.infer(program, method);
 
         for (BasicBlock block : program.getBasicBlocks()) {
             for (Instruction instruction : block) {
@@ -407,11 +438,19 @@ public class Inlining {
                 }
 
                 Set<MethodReference> implementations = new HashSet<>();
-                for (String className : inference.classesOf(invoke.getInstance().getIndex())) {
-                    MethodReference rawMethod = new MethodReference(className, invoke.getMethod().getDescriptor());
-                    MethodReader resolvedMethod = dependencyInfo.getClassSource().resolveImplementation(rawMethod);
-                    if (resolvedMethod != null) {
-                        implementations.add(resolvedMethod.getReference());
+                if (classInference.isOverflow(invoke.getInstance().getIndex())) {
+                    List<? extends MethodReference> knownImplementations = classInference.getMethodImplementations(
+                            invoke.getMethod().getDescriptor());
+                    if (knownImplementations != null) {
+                        implementations.addAll(knownImplementations);
+                    }
+                } else {
+                    for (String className : classInference.classesOf(invoke.getInstance().getIndex())) {
+                        MethodReference rawMethod = new MethodReference(className, invoke.getMethod().getDescriptor());
+                        MethodReader resolvedMethod = dependencyInfo.getClassSource().resolveImplementation(rawMethod);
+                        if (resolvedMethod != null) {
+                            implementations.add(resolvedMethod.getReference());
+                        }
                     }
                 }
 
@@ -423,13 +462,14 @@ public class Inlining {
         }
     }
 
-    private class PlanEntry {
+    static class PlanEntry {
         int targetBlock;
         Instruction targetInstruction;
         MethodReference method;
         Program program;
         int depth;
         final List<PlanEntry> innerPlan = new ArrayList<>();
+        InliningInfo locationInfo;
     }
 
     static class MethodUsageCounter extends AbstractInstructionReader {

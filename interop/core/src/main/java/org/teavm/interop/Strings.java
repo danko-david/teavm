@@ -22,4 +22,8 @@ public final class Strings {
     public static native Address toC(String javaString);
 
     public static native String fromC(Address cString);
+
+    public static native Address toC16(String javaString);
+
+    public static native String fromC16(Address cString);
 }

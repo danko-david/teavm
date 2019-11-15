@@ -31,12 +31,15 @@ import java.util.List;
 import java.util.Properties;
 import java.util.Set;
 import org.teavm.ast.decompilation.Decompiler;
+import org.teavm.backend.lowlevel.analyze.LowLevelInliningFilterFactory;
+import org.teavm.backend.lowlevel.generate.NameProvider;
+import org.teavm.backend.lowlevel.generate.NameProviderWithSpecialNames;
 import org.teavm.backend.wasm.binary.BinaryWriter;
-import org.teavm.backend.wasm.generate.NameProvider;
 import org.teavm.backend.wasm.generate.WasmClassGenerator;
 import org.teavm.backend.wasm.generate.WasmDependencyListener;
 import org.teavm.backend.wasm.generate.WasmGenerationContext;
 import org.teavm.backend.wasm.generate.WasmGenerator;
+import org.teavm.backend.wasm.generate.WasmNameProvider;
 import org.teavm.backend.wasm.generate.WasmStringPool;
 import org.teavm.backend.wasm.generators.ArrayGenerator;
 import org.teavm.backend.wasm.generators.WasmMethodGenerator;
@@ -52,6 +55,7 @@ import org.teavm.backend.wasm.intrinsics.FunctionIntrinsic;
 import org.teavm.backend.wasm.intrinsics.GCIntrinsic;
 import org.teavm.backend.wasm.intrinsics.IntegerIntrinsic;
 import org.teavm.backend.wasm.intrinsics.LongIntrinsic;
+import org.teavm.backend.wasm.intrinsics.MemoryTraceIntrinsic;
 import org.teavm.backend.wasm.intrinsics.MutatorIntrinsic;
 import org.teavm.backend.wasm.intrinsics.ObjectIntrinsic;
 import org.teavm.backend.wasm.intrinsics.PlatformClassIntrinsic;
@@ -61,6 +65,7 @@ import org.teavm.backend.wasm.intrinsics.PlatformObjectIntrinsic;
 import org.teavm.backend.wasm.intrinsics.RuntimeClassIntrinsic;
 import org.teavm.backend.wasm.intrinsics.ShadowStackIntrinsic;
 import org.teavm.backend.wasm.intrinsics.StructureIntrinsic;
+import org.teavm.backend.wasm.intrinsics.WasmHeapIntrinsic;
 import org.teavm.backend.wasm.intrinsics.WasmIntrinsicFactory;
 import org.teavm.backend.wasm.intrinsics.WasmIntrinsicFactoryContext;
 import org.teavm.backend.wasm.intrinsics.WasmRuntimeIntrinsic;
@@ -133,12 +138,14 @@ import org.teavm.model.lowlevel.Characteristics;
 import org.teavm.model.lowlevel.ClassInitializerEliminator;
 import org.teavm.model.lowlevel.ClassInitializerTransformer;
 import org.teavm.model.lowlevel.ShadowStackTransformer;
+import org.teavm.model.optimization.InliningFilterFactory;
 import org.teavm.model.transformation.ClassPatch;
 import org.teavm.runtime.Allocator;
 import org.teavm.runtime.ExceptionHandling;
 import org.teavm.runtime.RuntimeArray;
 import org.teavm.runtime.RuntimeClass;
 import org.teavm.runtime.RuntimeObject;
+import org.teavm.runtime.ShadowStack;
 import org.teavm.vm.BuildTarget;
 import org.teavm.vm.TeaVMEntryPoint;
 import org.teavm.vm.TeaVMTarget;
@@ -146,7 +153,15 @@ import org.teavm.vm.TeaVMTargetController;
 import org.teavm.vm.spi.TeaVMHostExtension;
 
 public class WasmTarget implements TeaVMTarget, TeaVMWasmHost {
+    private static final MethodReference INIT_HEAP_REF = new MethodReference(WasmHeap.class, "initHeap",
+            Address.class, int.class, int.class, int.class, void.class);
+    private static final MethodReference RESIZE_HEAP_REF = new MethodReference(WasmHeap.class, "resizeHeap",
+            int.class, void.class);
+    private static final Set<MethodReference> VIRTUAL_METHODS = new HashSet<>(Arrays.asList(
+            new MethodReference(Object.class, "clone", Object.class)));
+
     private TeaVMTargetController controller;
+    private Characteristics characteristics;
     private boolean debugging;
     private boolean wastEmitted;
     private boolean cEmitted;
@@ -156,16 +171,18 @@ public class WasmTarget implements TeaVMTarget, TeaVMWasmHost {
     private ShadowStackTransformer shadowStackTransformer;
     private WasmBinaryVersion version = WasmBinaryVersion.V_0x1;
     private List<WasmIntrinsicFactory> additionalIntrinsics = new ArrayList<>();
-    private int minHeapSize;
+    private int minHeapSize = 2 * 1024 * 1024;
+    private int maxHeapSize = 128 * 1024 * 1024;
 
     @Override
     public void setController(TeaVMTargetController controller) {
         this.controller = controller;
-        Characteristics managedMethodRepository = new Characteristics(
-                controller.getUnprocessedClassSource());
+        characteristics = new Characteristics(controller.getUnprocessedClassSource());
         classInitializerEliminator = new ClassInitializerEliminator(controller.getUnprocessedClassSource());
         classInitializerTransformer = new ClassInitializerTransformer();
-        shadowStackTransformer = new ShadowStackTransformer(managedMethodRepository);
+        shadowStackTransformer = new ShadowStackTransformer(characteristics, true);
+
+        controller.addVirtualMethods(VIRTUAL_METHODS::contains);
     }
 
     @Override
@@ -238,6 +255,10 @@ public class WasmTarget implements TeaVMTarget, TeaVMWasmHost {
         this.minHeapSize = minHeapSize;
     }
 
+    public void setMaxHeapSize(int maxHeapSize) {
+        this.maxHeapSize = maxHeapSize;
+    }
+
     @Override
     public void contributeDependencies(DependencyAnalyzer dependencyAnalyzer) {
         for (Class<?> type : Arrays.asList(int.class, long.class, float.class, double.class)) {
@@ -278,6 +299,9 @@ public class WasmTarget implements TeaVMTarget, TeaVMWasmHost {
                 int.class, void.class)).use();
         dependencyAnalyzer.linkMethod(new MethodReference(WasmRuntime.class, "printOutOfMemory",
                 void.class)).use();
+
+        dependencyAnalyzer.linkMethod(INIT_HEAP_REF).use();
+        dependencyAnalyzer.linkMethod(RESIZE_HEAP_REF).use();
 
         dependencyAnalyzer.linkMethod(new MethodReference(Allocator.class, "allocate",
                 RuntimeClass.class, Address.class)).use();
@@ -327,11 +351,12 @@ public class WasmTarget implements TeaVMTarget, TeaVMWasmHost {
         ClassHierarchy hierarchy = new ClassHierarchy(classes);
         TagRegistry tagRegistry = new TagRegistry(classes, hierarchy);
         BinaryWriter binaryWriter = new BinaryWriter(256);
-        NameProvider names = new NameProvider(controller.getUnprocessedClassSource());
+        NameProvider names = new NameProviderWithSpecialNames(new WasmNameProvider(),
+                controller.getUnprocessedClassSource());
         WasmClassGenerator classGenerator = new WasmClassGenerator(classes, controller.getUnprocessedClassSource(),
                 vtableProvider, tagRegistry, binaryWriter, names);
 
-        Decompiler decompiler = new Decompiler(classes, new HashSet<>(), false, true);
+        Decompiler decompiler = new Decompiler(classes, new HashSet<>(), false);
         WasmStringPool stringPool = classGenerator.getStringPool();
         WasmGenerationContext context = new WasmGenerationContext(classes, module, controller.getDiagnostics(),
                 vtableProvider, tagRegistry, stringPool, names);
@@ -355,6 +380,8 @@ public class WasmTarget implements TeaVMTarget, TeaVMWasmHost {
         context.addIntrinsic(new ObjectIntrinsic());
         context.addIntrinsic(new ConsoleIntrinsic());
         context.addGenerator(new ArrayGenerator());
+        context.addIntrinsic(new MemoryTraceIntrinsic());
+        context.addIntrinsic(new WasmHeapIntrinsic());
 
         IntrinsicFactoryContext intrinsicFactoryContext = new IntrinsicFactoryContext();
         for (WasmIntrinsicFactory additionalIntrinsicFactory : additionalIntrinsics) {
@@ -372,37 +399,26 @@ public class WasmTarget implements TeaVMTarget, TeaVMWasmHost {
 
         WasmGenerator generator = new WasmGenerator(decompiler, classes, context, classGenerator, binaryWriter);
 
-        int pageSize = 1 << 16;
-        int pages = (minHeapSize + pageSize - 1) / pageSize;
-        module.setMemorySize(pages);
         generateMethods(classes, context, generator, classGenerator, binaryWriter, module);
         exceptionHandlingIntrinsic.postProcess(CallSiteDescriptor.extract(classes, classes.getClassNames()));
         generateIsSupertypeFunctions(tagRegistry, module, classGenerator);
         classGenerator.postProcess();
         mutatorIntrinsic.setStaticGcRootsAddress(classGenerator.getStaticGcRootsAddress());
+        mutatorIntrinsic.setClassesAddress(classGenerator.getClassesAddress());
+        mutatorIntrinsic.setClassCount(classGenerator.getClassCount());
 
         WasmMemorySegment dataSegment = new WasmMemorySegment();
         dataSegment.setData(binaryWriter.getData());
         dataSegment.setOffset(256);
         module.getSegments().add(dataSegment);
 
-        renderMemoryLayout(module, binaryWriter.getAddress(), gcIntrinsic, wasmRuntimeIntrinsic);
+        renderMemoryLayout(module, binaryWriter.getAddress(), gcIntrinsic);
         renderClinit(classes, classGenerator, module);
         if (controller.wasCancelled()) {
             return;
         }
 
-        for (String className : classes.getClassNames()) {
-            ClassReader cls = classes.get(className);
-            if (cls.getAnnotations().get(StaticInit.class.getName()) == null) {
-                continue;
-            }
-            MethodReader clinit = cls.getMethod(new MethodDescriptor("<clinit>", void.class));
-            if (clinit == null) {
-                continue;
-            }
-            initFunction.getBody().add(new WasmCall(names.forClassInitializer(className)));
-        }
+        generateInitFunction(classes, initFunction, names, binaryWriter.getAddress());
         module.add(initFunction);
         module.setStartFunction(initFunction);
 
@@ -468,6 +484,39 @@ public class WasmTarget implements TeaVMTarget, TeaVMWasmHost {
         public Properties getProperties() {
             return controller.getProperties();
         }
+    }
+
+    private void generateInitFunction(ListableClassReaderSource classes, WasmFunction initFunction,
+            NameProvider names, int heapAddress) {
+
+        for (Class<?> javaCls : new Class<?>[] { WasmRuntime.class, WasmHeap.class }) {
+            ClassReader cls = classes.get(javaCls.getName());
+            MethodReader clinit = cls.getMethod(new MethodDescriptor("<clinit>", void.class));
+            if (clinit == null) {
+                continue;
+            }
+            initFunction.getBody().add(new WasmCall(names.forClassInitializer(cls.getName())));
+        }
+
+        initFunction.getBody().add(new WasmCall(names.forMethod(INIT_HEAP_REF),
+                new WasmInt32Constant(heapAddress), new WasmInt32Constant(minHeapSize),
+                new WasmInt32Constant(maxHeapSize), new WasmInt32Constant(WasmHeap.DEFAULT_STACK_SIZE)));
+
+        for (String className : classes.getClassNames()) {
+            if (className.equals(WasmRuntime.class.getName()) || className.equals(WasmHeap.class.getName())) {
+                continue;
+            }
+            ClassReader cls = classes.get(className);
+            if (cls.getAnnotations().get(StaticInit.class.getName()) == null) {
+                continue;
+            }
+            MethodReader clinit = cls.getMethod(new MethodDescriptor("<clinit>", void.class));
+            if (clinit == null) {
+                continue;
+            }
+            initFunction.getBody().add(new WasmCall(names.forClassInitializer(className)));
+        }
+
     }
 
     private String getBaseName(String name) {
@@ -557,7 +606,7 @@ public class WasmTarget implements TeaVMTarget, TeaVMWasmHost {
                 if (methodGenerator != null) {
                     WasmFunction function = context.getFunction(context.names.forMethod(method.getReference()));
                     methodGenerator.apply(method.getReference(), function, methodGeneratorContext);
-                } else {
+                } else if (!isShadowStackMethod(method.getReference())) {
                     if (context.getImportedMethod(method.getReference()) == null) {
                         CallLocation location = new CallLocation(method.getReference());
                         controller.getDiagnostics().error(location, "Method {{m0}} is native but "
@@ -578,6 +627,21 @@ public class WasmTarget implements TeaVMTarget, TeaVMWasmHost {
             if (controller.wasCancelled()) {
                 return;
             }
+        }
+    }
+
+    private boolean isShadowStackMethod(MethodReference method) {
+        if (!method.getClassName().equals(ShadowStack.class.getName())) {
+            return false;
+        }
+        switch (method.getName()) {
+            case "allocStack":
+            case "registerGCRoot":
+            case "removeGCRoot":
+            case "releaseStack":
+                return true;
+            default:
+                return false;
         }
     }
 
@@ -739,9 +803,7 @@ public class WasmTarget implements TeaVMTarget, TeaVMWasmHost {
             block.getBody().add(new WasmStoreInt32(4, new WasmInt32Constant(index), initFlag,
                     WasmInt32Subtype.INT32));
 
-            if (method != null) {
-                block.getBody().add(new WasmCall(classGenerator.names.forMethod(method.getReference())));
-            }
+            block.getBody().add(new WasmCall(classGenerator.names.forMethod(method.getReference())));
 
             if (controller.wasCancelled()) {
                 break;
@@ -749,32 +811,20 @@ public class WasmTarget implements TeaVMTarget, TeaVMWasmHost {
         }
     }
 
-    private void renderMemoryLayout(WasmModule module, int address, GCIntrinsic gcIntrinsic,
-            WasmRuntimeIntrinsic runtimeIntrinsic) {
-        address = (((address - 1) / 256) + 1) * 256;
+    private void renderMemoryLayout(WasmModule module, int address, GCIntrinsic gcIntrinsic) {
+        module.setMinMemorySize(WasmRuntime.align(address, WasmHeap.PAGE_SIZE) / WasmHeap.PAGE_SIZE);
 
-        runtimeIntrinsic.setStackAddress(address);
-        address += 65536;
+        int newStorageSize = WasmHeap.calculateStorageSize(maxHeapSize);
+        int newRegionsCount = WasmHeap.calculateRegionsCount(maxHeapSize, WasmHeap.DEFAULT_REGION_SIZE);
+        int newRegionsSize = WasmHeap.calculateRegionsSize(newRegionsCount);
 
-        int gcMemory = module.getMemorySize() * 65536 - address;
-        int storageSize = (gcMemory >> 6) >> 2 << 2;
-        gcIntrinsic.setGCStorageAddress(address);
-        gcIntrinsic.setGCStorageSize(storageSize);
+        address = WasmRuntime.align(address + WasmHeap.DEFAULT_STACK_SIZE, 16);
+        address = WasmRuntime.align(address + maxHeapSize, 16);
+        address = WasmRuntime.align(address + newRegionsSize, 16);
+        address = WasmRuntime.align(address + newStorageSize, 16);
+        gcIntrinsic.setRegionSize(WasmHeap.DEFAULT_REGION_SIZE);
 
-        gcMemory -= storageSize;
-        address += storageSize;
-        int regionSize = 32768;
-        int regionCount = gcMemory / (2 + regionSize) + 1;
-        gcIntrinsic.setRegionSize(regionSize);
-        gcIntrinsic.setRegionsAddress(address);
-        gcIntrinsic.setRegionMaxCount(regionCount);
-
-        address += regionCount * 2;
-        address = (address + 4) >> 2 << 2;
-
-        gcMemory = module.getMemorySize() * 65536 - address;
-        gcIntrinsic.setHeapAddress(address);
-        gcIntrinsic.setAvailableBytes(gcMemory);
+        module.setMaxMemorySize(WasmRuntime.align(address, WasmHeap.PAGE_SIZE) / WasmHeap.PAGE_SIZE);
     }
 
     private VirtualTableProvider createVirtualTableProvider(ListableClassHolderSource classes) {
@@ -821,6 +871,11 @@ public class WasmTarget implements TeaVMTarget, TeaVMWasmHost {
     @Override
     public boolean isAsyncSupported() {
         return false;
+    }
+
+    @Override
+    public InliningFilterFactory getInliningFilter() {
+        return new LowLevelInliningFilterFactory(characteristics);
     }
 
     static class MethodGeneratorContextImpl implements WasmMethodGeneratorContext {

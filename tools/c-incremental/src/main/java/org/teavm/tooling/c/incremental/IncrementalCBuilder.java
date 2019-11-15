@@ -33,6 +33,7 @@ import java.util.Set;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import org.teavm.backend.c.CTarget;
+import org.teavm.backend.c.generate.CNameProvider;
 import org.teavm.cache.InMemoryMethodNodeCache;
 import org.teavm.cache.InMemoryProgramCache;
 import org.teavm.cache.InMemorySymbolTable;
@@ -62,11 +63,14 @@ import org.teavm.vm.TeaVMProgressListener;
 public class IncrementalCBuilder {
     private String mainClass;
     private String[] classPath;
-    private int minHeapSize = 32;
+    private int minHeapSize = 4;
+    private int maxHeapSize = 128;
+    private boolean longjmpSupported = true;
     private boolean lineNumbersGenerated;
     private String targetPath;
     private String externalTool;
     private String externalToolWorkingDir;
+    private String mainFunctionName;
 
     private IncrementalDirectoryBuildTarget buildTarget;
     private FileSystemWatcher watcher;
@@ -82,6 +86,7 @@ public class IncrementalCBuilder {
 
     private List<BuilderListener> listeners = new ArrayList<>();
     private final Set<ProgressHandler> progressHandlers = new LinkedHashSet<>();
+    private final CNameProvider nameProvider = new CNameProvider();
 
     private int lastReachedClasses;
     private final Object statusLock = new Object();
@@ -106,6 +111,10 @@ public class IncrementalCBuilder {
         this.minHeapSize = minHeapSize;
     }
 
+    public void setMaxHeapSize(int maxHeapSize) {
+        this.maxHeapSize = maxHeapSize;
+    }
+
     public void setLineNumbersGenerated(boolean lineNumbersGenerated) {
         this.lineNumbersGenerated = lineNumbersGenerated;
     }
@@ -124,6 +133,14 @@ public class IncrementalCBuilder {
 
     public void setExternalToolWorkingDir(String externalToolWorkingDir) {
         this.externalToolWorkingDir = externalToolWorkingDir;
+    }
+
+    public void setMainFunctionName(String mainFunctionName) {
+        this.mainFunctionName = mainFunctionName;
+    }
+
+    public void setLongjmpSupported(boolean longjmpSupported) {
+        this.longjmpSupported = longjmpSupported;
     }
 
     public void addProgressHandler(ProgressHandler handler) {
@@ -244,6 +261,7 @@ public class IncrementalCBuilder {
 
     private List<String> getChangedClasses(Collection<File> changedFiles) {
         List<String> result = new ArrayList<>();
+        String[] prefixes = Arrays.stream(classPath).map(s -> s.replace('\\', '/')).toArray(String[]::new);
 
         for (File file : changedFiles) {
             String path = file.getPath().replace('\\', '/');
@@ -251,7 +269,7 @@ public class IncrementalCBuilder {
                 continue;
             }
 
-            String prefix = Arrays.stream(classPath)
+            String prefix = Arrays.stream(prefixes)
                     .filter(path::startsWith)
                     .findFirst()
                     .orElse("");
@@ -307,7 +325,7 @@ public class IncrementalCBuilder {
         classSource.setProvider(name -> PreOptimizingClassHolderSource.optimize(classPathMapper, name));
 
         long startTime = System.currentTimeMillis();
-        CTarget cTarget = new CTarget();
+        CTarget cTarget = new CTarget(nameProvider);
         cTarget.setAstCache(astCache);
 
         TeaVM vm = new TeaVMBuilder(cTarget)
@@ -320,7 +338,10 @@ public class IncrementalCBuilder {
 
         cTarget.setIncremental(true);
         cTarget.setMinHeapSize(minHeapSize * 1024 * 1024);
+        cTarget.setMaxHeapSize(maxHeapSize * 1024 * 1024);
         cTarget.setLineNumbersGenerated(lineNumbersGenerated);
+        cTarget.setLongjmpUsed(longjmpSupported);
+        cTarget.setHeapDump(true);
         vm.setOptimizationLevel(TeaVMOptimizationLevel.SIMPLE);
         vm.setCacheStatus(classSource);
         vm.addVirtualMethods(m -> true);
@@ -329,7 +350,7 @@ public class IncrementalCBuilder {
         vm.installPlugins();
 
         vm.setLastKnownClasses(lastReachedClasses);
-        vm.entryPoint(mainClass);
+        vm.entryPoint(mainClass, mainFunctionName != null ? mainFunctionName : "main");
 
         log.info("Starting build");
         progressListener.last = 0;
@@ -343,6 +364,7 @@ public class IncrementalCBuilder {
 
     private void postBuild(TeaVM vm, long startTime) {
         needsExternalTool = false;
+        boolean hasErrors = false;
         if (!vm.wasCancelled()) {
             log.info("Recompiled stale methods: " + programCache.getPendingItemsCount());
             fireBuildComplete(vm);
@@ -355,6 +377,7 @@ public class IncrementalCBuilder {
                 reportCompilationComplete(true);
                 needsExternalTool = true;
             } else {
+                hasErrors = true;
                 log.info("Build complete with errors");
                 reportCompilationComplete(false);
             }
@@ -367,7 +390,9 @@ public class IncrementalCBuilder {
 
         astCache.discard();
         programCache.discard();
-        buildTarget.reset();
+        if (!vm.wasCancelled() && !hasErrors) {
+            buildTarget.reset();
+        }
         cancelRequested = false;
     }
 
@@ -394,6 +419,7 @@ public class IncrementalCBuilder {
 
         try {
             log.info("Running external tool");
+            long start = System.currentTimeMillis();
             ProcessBuilder pb = new ProcessBuilder(externalTool);
             if (externalToolWorkingDir != null) {
                 pb.directory(new File(externalToolWorkingDir));
@@ -411,6 +437,8 @@ public class IncrementalCBuilder {
             int code = process.waitFor();
             if (code != 0) {
                 log.error("External tool returned non-zero code: " + code);
+            } else {
+                log.info("External tool took " + (System.currentTimeMillis() - start) + " ms");
             }
         } catch (IOException e) {
             log.error("Could not start external tool", e);

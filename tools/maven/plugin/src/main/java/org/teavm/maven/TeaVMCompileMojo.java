@@ -137,14 +137,23 @@ public class TeaVMCompileMojo extends AbstractMojo {
     @Parameter(property = "teavm.wasmVersion", defaultValue = "V_0x1")
     private WasmBinaryVersion wasmVersion = WasmBinaryVersion.V_0x1;
 
-    @Parameter(property = "teavm.heapSize", defaultValue = "32")
-    private int heapSize;
+    @Parameter(property = "teavm.minHeapSize", defaultValue = "4")
+    private int minHeapSize;
+
+    @Parameter(property = "teavm.maxHeapSize", defaultValue = "128")
+    private int maxHeapSize;
 
     @Parameter(property = "teavm.outOfProcess", defaultValue = "false")
     private boolean outOfProcess;
 
     @Parameter(property = "teavm.processMemory", defaultValue = "512")
     private int processMemory;
+
+    @Parameter(property = "teavm.longjmpSupported", defaultValue = "true")
+    private boolean longjmpSupported;
+
+    @Parameter(property = "teavm.heapDump", defaultValue = "false")
+    private boolean heapDump;
 
     private void setupBuilder(BuildStrategy builder) throws MojoExecutionException {
         builder.setLog(new MavenTeaVMToolLog(getLog()));
@@ -167,7 +176,8 @@ public class TeaVMCompileMojo extends AbstractMojo {
             builder.setDebugInformationGenerated(debugInformationGenerated);
             builder.setSourceMapsFileGenerated(sourceMapsGenerated);
             builder.setSourceFilesCopied(sourceFilesCopied);
-            builder.setHeapSize(heapSize * 1024 * 1024);
+            builder.setMinHeapSize(minHeapSize * 1024 * 1024);
+            builder.setMaxHeapSize(maxHeapSize * 1024 * 1024);
         } catch (RuntimeException e) {
             throw new MojoExecutionException("Unexpected error occurred", e);
         }
@@ -277,6 +287,8 @@ public class TeaVMCompileMojo extends AbstractMojo {
             builder.setCacheDirectory(cacheDirectory.getAbsolutePath());
             builder.setTargetType(targetType);
             builder.setWasmVersion(wasmVersion);
+            builder.setLongjmpSupported(longjmpSupported);
+            builder.setHeapDump(heapDump);
             BuildResult result;
             result = builder.build();
             TeaVMProblemRenderer.describeProblems(result.getCallGraph(), result.getProblems(), toolLog);

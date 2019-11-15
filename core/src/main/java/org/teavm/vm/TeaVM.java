@@ -89,6 +89,7 @@ import org.teavm.model.optimization.MethodOptimization;
 import org.teavm.model.optimization.MethodOptimizationContext;
 import org.teavm.model.optimization.RedundantJumpElimination;
 import org.teavm.model.optimization.RedundantNullCheckElimination;
+import org.teavm.model.optimization.RepeatedFieldReadElimination;
 import org.teavm.model.optimization.ScalarReplacement;
 import org.teavm.model.optimization.UnreachableBasicBlockElimination;
 import org.teavm.model.optimization.UnusedVariableElimination;
@@ -462,12 +463,13 @@ public class TeaVM implements TeaVMHost, ServiceRepository {
 
         dependencyAnalyzer.cleanupTypes();
 
+        target.setController(targetController);
+
         inline(classSet);
         if (wasCancelled()) {
             return null;
         }
 
-        target.setController(targetController);
         target.analyzeBeforeOptimizations(new ListableClassReaderSourceAdapter(
                 dependencyAnalyzer.getClassSource(),
                 new LinkedHashSet<>(dependencyAnalyzer.getReachableClasses())));
@@ -621,13 +623,14 @@ public class TeaVM implements TeaVMHost, ServiceRepository {
 
         InliningStrategy inliningStrategy;
         if (optimizationLevel == TeaVMOptimizationLevel.FULL) {
-            inliningStrategy = new DefaultInliningStrategy(14, 7, 300, false);
+            inliningStrategy = new DefaultInliningStrategy(20, 7, 300, false);
         } else {
             inliningStrategy = new DefaultInliningStrategy(100, 7, 300, true);
         }
 
         Inlining inlining = new Inlining(new ClassHierarchy(classes), dependencyAnalyzer, inliningStrategy,
-                classes, this::isExternal, optimizationLevel == TeaVMOptimizationLevel.FULL);
+                classes, this::isExternal, optimizationLevel == TeaVMOptimizationLevel.FULL,
+                target.getInliningFilter());
         List<MethodReference> methodReferences = inlining.getOrder();
         int classCount = classes.getClassNames().size();
         int initialValue = compileProgressValue;
@@ -748,6 +751,11 @@ public class TeaVM implements TeaVMHost, ServiceRepository {
         public DependencyInfo getDependencyInfo() {
             return dependencyAnalyzer;
         }
+
+        @Override
+        public ClassReaderSource getClassSource() {
+            return dependencyAnalyzer.getClassSource();
+        }
     }
 
     private List<MethodOptimization> getOptimizations() {
@@ -759,9 +767,12 @@ public class TeaVM implements TeaVMHost, ServiceRepository {
             //optimizations.add(new LoopInversion());
             optimizations.add(new LoopInvariantMotion());
         }
+        if (optimizationLevel.ordinal() >= TeaVMOptimizationLevel.FULL.ordinal()) {
+            optimizations.add(new RepeatedFieldReadElimination());
+        }
         optimizations.add(new GlobalValueNumbering(optimizationLevel == TeaVMOptimizationLevel.SIMPLE));
+        optimizations.add(new RedundantNullCheckElimination());
         if (optimizationLevel.ordinal() >= TeaVMOptimizationLevel.ADVANCED.ordinal()) {
-            optimizations.add(new RedundantNullCheckElimination());
             optimizations.add(new ConstantConditionElimination());
             optimizations.add(new RedundantJumpElimination());
             optimizations.add(new UnusedVariableElimination());
@@ -962,11 +973,14 @@ public class TeaVM implements TeaVMHost, ServiceRepository {
 
                 for (MethodHolder method : cls.getMethods().toArray(new MethodHolder[0])) {
                     MethodDependencyInfo methodDep = dependencyAnalyzer.getMethod(method.getReference());
-                    if (methodDep == null) {
-                        cls.removeMethod(method);
-                    } else if (!methodDep.isUsed()) {
-                        method.getModifiers().add(ElementModifier.ABSTRACT);
-                        method.setProgram(null);
+                    if (methodDep == null || !methodDep.isUsed()) {
+                        if (method.hasModifier(ElementModifier.STATIC)) {
+                            cls.removeMethod(method);
+                        } else {
+                            method.getModifiers().add(ElementModifier.ABSTRACT);
+                            method.getModifiers().remove(ElementModifier.NATIVE);
+                            method.setProgram(null);
+                        }
                     } else {
                         MethodReader methodReader = classReader.getMethod(method.getDescriptor());
                         if (methodReader != null && methodReader.getProgram() != null) {

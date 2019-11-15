@@ -15,6 +15,7 @@
  */
 package org.teavm.runtime;
 
+import org.teavm.backend.c.intrinsic.RuntimeInclude;
 import org.teavm.interop.Import;
 import org.teavm.interop.StaticInit;
 import org.teavm.interop.Unmanaged;
@@ -28,5 +29,6 @@ public final class Console {
     public static native void printString(String s);
 
     @Import(name = "teavm_printInt")
+    @RuntimeInclude("log.h")
     public static native void printInt(int n);
 }

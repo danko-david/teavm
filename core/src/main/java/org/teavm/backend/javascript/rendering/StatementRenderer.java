@@ -30,6 +30,7 @@ import org.teavm.ast.AssignmentStatement;
 import org.teavm.ast.BinaryExpr;
 import org.teavm.ast.BinaryOperation;
 import org.teavm.ast.BlockStatement;
+import org.teavm.ast.BoundCheckExpr;
 import org.teavm.ast.BreakStatement;
 import org.teavm.ast.CastExpr;
 import org.teavm.ast.ConditionalExpr;
@@ -112,6 +113,11 @@ public class StatementRenderer implements ExprVisitor, StatementVisitor {
         this.minifying = context.isMinifying();
         this.naming = context.getNaming();
         this.debugEmitter = context.getDebugEmitter();
+        if (!minifying) {
+            usedVariableNames.add("$tmp");
+            usedVariableNames.add("$ptr");
+            usedVariableNames.add("$thread");
+        }
     }
 
     public boolean isLongLibraryUsed() {
@@ -1107,6 +1113,11 @@ public class StatementRenderer implements ExprVisitor, StatementVisitor {
             if (injector != null) {
                 injector.generate(new InjectorContextImpl(expr.getArguments()), expr.getMethod());
             } else {
+                Precedence outerPrecedence = precedence;
+                if (outerPrecedence.ordinal() > Precedence.FUNCTION_CALL.ordinal()) {
+                    writer.append('(');
+                }
+
                 if (expr.getType() == InvocationType.DYNAMIC) {
                     precedence = Precedence.MEMBER_ACCESS;
                     expr.getArguments().get(0).acceptVisitor(this);
@@ -1178,6 +1189,10 @@ public class StatementRenderer implements ExprVisitor, StatementVisitor {
                 if (shouldEraseCallSite) {
                     lastCallSite = null;
                 }
+
+                if (outerPrecedence.ordinal() > Precedence.FUNCTION_CALL.ordinal()) {
+                    writer.append(')');
+                }
             }
             if (expr.getLocation() != null) {
                 popLocation();
@@ -1218,14 +1233,14 @@ public class StatementRenderer implements ExprVisitor, StatementVisitor {
             }
 
             Precedence outerPrecedence = precedence;
-            if (outerPrecedence.ordinal() > Precedence.FUNCTION_CALL.ordinal()) {
+            if (outerPrecedence.ordinal() > Precedence.NEW.ordinal()) {
                 writer.append('(');
             }
 
-            precedence = Precedence.FUNCTION_CALL;
+            precedence = Precedence.NEW;
 
             writer.append("new ").appendClass(expr.getConstructedClass());
-            if (outerPrecedence.ordinal() > Precedence.FUNCTION_CALL.ordinal()) {
+            if (outerPrecedence.ordinal() > Precedence.NEW.ordinal()) {
                 writer.append(')');
             }
 
@@ -1447,7 +1462,8 @@ public class StatementRenderer implements ExprVisitor, StatementVisitor {
                     .softNewLine();
             boolean first = true;
             boolean defaultHandlerOccurred = false;
-            for (TryCatchStatement catchClause : sequence) {
+            for (int i = sequence.size() - 1; i >= 0; --i) {
+                TryCatchStatement catchClause = sequence.get(i);
                 if (!first) {
                     writer.ws().append("else");
                 }
@@ -1552,6 +1568,40 @@ public class StatementRenderer implements ExprVisitor, StatementVisitor {
             }
         } catch (IOException ex) {
             throw new RenderingException("IO error occurred", ex);
+        }
+    }
+
+    @Override
+    public void visit(BoundCheckExpr expr) {
+        try {
+            if (expr.getLocation() != null) {
+                pushLocation(expr.getLocation());
+            }
+
+            if (expr.getArray() != null && expr.isLower()) {
+                writer.appendFunction("$rt_checkBounds").append("(");
+            } else if (expr.getArray() != null) {
+                writer.appendFunction("$rt_checkUpperBound").append("(");
+            } else if (expr.isLower()) {
+                writer.appendFunction("$rt_checkLowerBound").append("(");
+            }
+
+            expr.getIndex().acceptVisitor(this);
+
+            if (expr.getArray() != null) {
+                writer.append(",").ws();
+                expr.getArray().acceptVisitor(this);
+            }
+
+            if (expr.getArray() != null || expr.isLower()) {
+                writer.append(")");
+            }
+
+            if (expr.getLocation() != null) {
+                popLocation();
+            }
+        } catch (IOException e) {
+            throw new RenderingException("IO error occurred", e);
         }
     }
 

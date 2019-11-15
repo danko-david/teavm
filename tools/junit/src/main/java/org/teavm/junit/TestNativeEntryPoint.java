@@ -15,17 +15,22 @@
  */
 package org.teavm.junit;
 
+import java.io.PrintStream;
+import org.teavm.classlib.impl.console.StderrOutputStream;
+import org.teavm.classlib.impl.console.StdoutOutputStream;
+
 final class TestNativeEntryPoint {
     private TestNativeEntryPoint() {
     }
 
-    public static void main(String[] args) throws Exception {
+    public static void main(String[] args) {
         try {
             TestEntryPoint.run();
-            System.out.println("SUCCESS");
+            new PrintStream(StdoutOutputStream.INSTANCE).println("SUCCESS");
         } catch (Throwable e) {
-            e.printStackTrace(System.out);
-            System.out.println("FAILURE");
+            PrintStream out = new PrintStream(StderrOutputStream.INSTANCE);
+            e.printStackTrace(out);
+            out.println("FAILURE");
         }
     }
 }

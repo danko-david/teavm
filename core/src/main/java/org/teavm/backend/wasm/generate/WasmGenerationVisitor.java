@@ -28,6 +28,7 @@ import java.util.Set;
 import org.teavm.ast.AssignmentStatement;
 import org.teavm.ast.BinaryExpr;
 import org.teavm.ast.BlockStatement;
+import org.teavm.ast.BoundCheckExpr;
 import org.teavm.ast.BreakStatement;
 import org.teavm.ast.CastExpr;
 import org.teavm.ast.ConditionalExpr;
@@ -63,6 +64,8 @@ import org.teavm.ast.UnaryExpr;
 import org.teavm.ast.UnwrapArrayExpr;
 import org.teavm.ast.VariableExpr;
 import org.teavm.ast.WhileStatement;
+import org.teavm.backend.lowlevel.generate.NameProvider;
+import org.teavm.backend.wasm.WasmHeap;
 import org.teavm.backend.wasm.WasmRuntime;
 import org.teavm.backend.wasm.binary.BinaryWriter;
 import org.teavm.backend.wasm.binary.DataPrimitives;
@@ -1014,7 +1017,7 @@ class WasmGenerationVisitor implements StatementVisitor, ExprVisitor {
                     + "Mutator.allocStack");
         }
 
-        int offset = classGenerator.getFieldOffset(new FieldReference(WasmRuntime.class.getName(), "stack"));
+        int offset = classGenerator.getFieldOffset(new FieldReference(WasmHeap.class.getName(), "stack"));
         WasmExpression oldValue = new WasmGetLocal(stackVariable);
         oldValue = new WasmIntBinary(WasmIntType.INT32, WasmIntBinaryOperation.SUB, oldValue,
                 new WasmInt32Constant(4));
@@ -1363,6 +1366,11 @@ class WasmGenerationVisitor implements StatementVisitor, ExprVisitor {
         result = emptyStatement(statement.getLocation());
     }
 
+    @Override
+    public void visit(BoundCheckExpr expr) {
+        expr.getIndex().acceptVisitor(this);
+    }
+
     private WasmExpression negate(WasmExpression expr) {
         if (expr instanceof WasmIntBinary) {
             WasmIntBinary binary = (WasmIntBinary) expr;
@@ -1539,6 +1547,11 @@ class WasmGenerationVisitor implements StatementVisitor, ExprVisitor {
         @Override
         public void releaseTemporary(WasmLocal local) {
             WasmGenerationVisitor.this.releaseTemporary(local);
+        }
+
+        @Override
+        public int getStaticField(FieldReference field) {
+            return classGenerator.getFieldOffset(field);
         }
     };
 

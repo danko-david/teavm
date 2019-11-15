@@ -26,12 +26,20 @@ class ListingLexer {
     private int index = -1;
     private int tokenStart;
 
-    public ListingLexer(Reader reader) {
+    ListingLexer(Reader reader) {
         this.reader = reader;
     }
 
     public ListingToken getToken() {
         return token;
+    }
+
+    public boolean tryConsumeIdentifier(String value) throws IOException, ListingParseException {
+        if (token == ListingToken.IDENTIFIER && value.equals(tokenValue)) {
+            nextToken();
+            return true;
+        }
+        return false;
     }
 
     public Object getTokenValue() {
@@ -61,6 +69,13 @@ class ListingLexer {
         switch (c) {
             case -1:
                 token = ListingToken.EOF;
+                break;
+            case '\r':
+                token = ListingToken.EOL;
+                nextChar();
+                if (c == '\n') {
+                    nextChar();
+                }
                 break;
             case '\n':
                 token = ListingToken.EOL;
@@ -139,7 +154,7 @@ class ListingLexer {
                 break;
             case '*':
                 nextChar();
-                token = ListingToken.SUBTRACT;
+                token = ListingToken.MULTIPLY;
                 break;
             case '/':
                 nextChar();

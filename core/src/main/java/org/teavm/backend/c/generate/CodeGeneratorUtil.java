@@ -15,6 +15,9 @@
  */
 package org.teavm.backend.c.generate;
 
+import org.teavm.backend.c.util.InteropUtil;
+import org.teavm.backend.lowlevel.generate.NameProvider;
+import org.teavm.model.ClassReader;
 import org.teavm.model.ValueType;
 
 public final class CodeGeneratorUtil {
@@ -68,8 +71,10 @@ public final class CodeGeneratorUtil {
                 writer.print("INFINITY");
             } else if (Float.isNaN(f)) {
                 writer.print("NAN");
-            } else {
+            } else  if ((int) f == f) {
                 writer.print(f + "f");
+            } else {
+                writer.print(Float.toHexString(f) + "f");
             }
         } else if (value instanceof Double) {
             double d = (Double) value;
@@ -80,14 +85,24 @@ public final class CodeGeneratorUtil {
                 writer.print("INFINITY");
             } else if (Double.isNaN(d)) {
                 writer.print("NAN");
-            } else {
+            } else if ((int) d == d) {
                 writer.print(value.toString());
+            } else {
+                writer.print(Double.toHexString(d));
             }
         } else if (value instanceof Boolean) {
             writer.print((Boolean) value ? "1" : "0");
+        } else if (value instanceof Character) {
+            writeIntValue(writer, (char) value);
         } else if (value instanceof ValueType) {
-            includes.includeType((ValueType) value);
-            writer.print("&").print(context.getNames().forClassInstance((ValueType) value));
+            ValueType type = (ValueType) value;
+            if (type instanceof ValueType.Object
+                    && !context.getCharacteristics().isManaged(((ValueType.Object) type).getClassName())) {
+                writer.print("NULL");
+            } else {
+                includes.includeType(type);
+                writer.print("&").print(context.getNames().forClassInstance(type));
+            }
         }
     }
 
@@ -99,4 +114,14 @@ public final class CodeGeneratorUtil {
         writer.print(String.valueOf(v));
     }
 
+    public static void printClassReference(CodeWriter writer, IncludeManager includes, NameProvider names,
+            ClassReader cls, String className) {
+        if (cls != null && InteropUtil.isNative(cls)) {
+            InteropUtil.processInclude(cls.getAnnotations(), includes);
+            InteropUtil.printNativeReference(writer, cls);
+        } else {
+            includes.includeClass(className);
+            writer.print(names.forClass(className));
+        }
+    }
 }

@@ -16,8 +16,11 @@
 package org.teavm.runtime;
 
 import java.util.Arrays;
+import org.teavm.backend.c.intrinsic.RuntimeInclude;
 import org.teavm.interop.Import;
+import org.teavm.interop.Platforms;
 import org.teavm.interop.StaticInit;
+import org.teavm.interop.UnsupportedOn;
 
 @StaticInit
 public final class EventQueue {
@@ -55,7 +58,7 @@ public final class EventQueue {
     }
 
     public static void kill(int id) {
-        for (int i = 0; i < data.length; ++i) {
+        for (int i = 0; i < size; ++i) {
             if (data[i].id == id) {
                 remove(i);
                 break;
@@ -125,9 +128,13 @@ public final class EventQueue {
     }
 
     @Import(name = "teavm_waitFor")
+    @RuntimeInclude("fiber.h")
+    @UnsupportedOn(Platforms.WEBASSEMBLY)
     private static native void waitFor(long time);
 
     @Import(name = "teavm_interrupt")
+    @RuntimeInclude("fiber.h")
+    @UnsupportedOn(Platforms.WEBASSEMBLY)
     private static native void interrupt();
 
     private static void ensureCapacity(int capacity) {

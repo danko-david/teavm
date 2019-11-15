@@ -58,6 +58,7 @@ import org.junit.runner.notification.Failure;
 import org.junit.runner.notification.RunNotifier;
 import org.junit.runners.model.InitializationError;
 import org.teavm.backend.c.CTarget;
+import org.teavm.backend.c.generate.CNameProvider;
 import org.teavm.backend.javascript.JavaScriptTarget;
 import org.teavm.backend.wasm.WasmTarget;
 import org.teavm.callgraph.CallGraph;
@@ -128,7 +129,6 @@ public class TeaVMTestRunner extends Runner implements Filterable {
 
     static {
         for (RunKind kind : RunKind.values()) {
-            runners.put(kind, new RunnerKindInfo());
             runners.put(kind, new RunnerKindInfo());
         }
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
@@ -278,7 +278,6 @@ public class TeaVMTestRunner extends Runner implements Filterable {
             ran = true;
             success = runInJvm(child, notifier, expectedExceptions);
         }
-
 
         if (success && outputDir != null) {
             int[] configurationIndex = new int[] { 0 };
@@ -565,6 +564,7 @@ public class TeaVMTestRunner extends Runner implements Filterable {
         DebugInformationBuilder debugEmitter = new DebugInformationBuilder(new ReferenceCache());
         Supplier<JavaScriptTarget> targetSupplier = () -> {
             JavaScriptTarget target = new JavaScriptTarget();
+            target.setStrict(true);
             if (decodeStack) {
                 target.setDebugEmitter(debugEmitter);
                 target.setStackTraceIncluded(true);
@@ -613,7 +613,7 @@ public class TeaVMTestRunner extends Runner implements Filterable {
     }
 
     private CTarget createCTarget() {
-        CTarget cTarget = new CTarget();
+        CTarget cTarget = new CTarget(new CNameProvider());
         cTarget.setLineNumbersGenerated(Boolean.parseBoolean(System.getProperty(C_LINE_NUMBERS, "false")));
         return cTarget;
     }

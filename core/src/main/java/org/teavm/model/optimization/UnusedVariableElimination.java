@@ -27,6 +27,7 @@ import org.teavm.model.instructions.AbstractInstructionVisitor;
 import org.teavm.model.instructions.ArrayLengthInstruction;
 import org.teavm.model.instructions.AssignInstruction;
 import org.teavm.model.instructions.BinaryInstruction;
+import org.teavm.model.instructions.BoundCheckInstruction;
 import org.teavm.model.instructions.CastInstruction;
 import org.teavm.model.instructions.CastIntegerInstruction;
 import org.teavm.model.instructions.CastNumberInstruction;
@@ -118,11 +119,11 @@ public class UnusedVariableElimination implements MethodOptimization {
         return false;
     }
 
-    private static class InstructionOptimizer extends AbstractInstructionVisitor {
+    static class InstructionOptimizer extends AbstractInstructionVisitor {
         private boolean[] used;
         boolean eliminate;
 
-        public InstructionOptimizer(boolean[] used) {
+        InstructionOptimizer(boolean[] used) {
             this.used = used;
         }
 
@@ -258,6 +259,11 @@ public class UnusedVariableElimination implements MethodOptimization {
 
         @Override
         public void visit(NullCheckInstruction insn) {
+            requestUsage(insn.getReceiver());
+        }
+
+        @Override
+        public void visit(BoundCheckInstruction insn) {
             requestUsage(insn.getReceiver());
         }
     }

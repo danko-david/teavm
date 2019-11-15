@@ -19,7 +19,6 @@ import com.carrotsearch.hppc.ObjectIntHashMap;
 import com.carrotsearch.hppc.ObjectIntMap;
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -46,7 +45,6 @@ import org.teavm.common.ServiceRepository;
 import org.teavm.debugging.information.DebugInformationEmitter;
 import org.teavm.debugging.information.DummyDebugInformationEmitter;
 import org.teavm.dependency.DependencyInfo;
-import org.teavm.dependency.MethodDependencyInfo;
 import org.teavm.diagnostics.Diagnostics;
 import org.teavm.model.ClassReader;
 import org.teavm.model.ClassReaderSource;
@@ -58,6 +56,7 @@ import org.teavm.model.MethodDescriptor;
 import org.teavm.model.MethodReader;
 import org.teavm.model.MethodReference;
 import org.teavm.model.ValueType;
+import org.teavm.model.analysis.ClassMetadataRequirements;
 import org.teavm.vm.RenderingException;
 import org.teavm.vm.TeaVMProgressFeedback;
 
@@ -251,7 +250,8 @@ public class Renderer implements RenderingManager {
     private void renderRuntimeAliases() throws IOException {
         String[] names = { "$rt_throw", "$rt_compare", "$rt_nullCheck", "$rt_cls", "$rt_createArray",
                 "$rt_isInstance", "$rt_nativeThread", "$rt_suspending", "$rt_resuming", "$rt_invalidPointer",
-                "$rt_s", "$rt_eraseClinit", "$rt_imul", "$rt_wrapException" };
+                "$rt_s", "$rt_eraseClinit", "$rt_imul", "$rt_wrapException", "$rt_checkBounds",
+                "$rt_checkUpperBound", "$rt_checkLowerBound" };
         boolean first = true;
         for (String name : names) {
             if (!first) {
@@ -414,8 +414,7 @@ public class Renderer implements RenderingManager {
 
         ScopedName name = naming.getNameForClassInit(cls.getName());
         renderFunctionDeclaration(name);
-        writer.append("()").ws()
-                .append("{").softNewLine().indent();
+        writer.append("()").ws().append("{").softNewLine().indent();
 
         if (isAsync) {
             writer.append("var ").append(context.pointerName()).ws().append("=").ws()
@@ -476,17 +475,17 @@ public class Renderer implements RenderingManager {
             return;
         }
 
-        Set<String> classesRequiringName = findClassesRequiringName();
+        ClassMetadataRequirements metadataRequirements = new ClassMetadataRequirements(context.getDependencyInfo());
 
         int start = writer.getOffset();
         try {
             writer.append("$rt_packages([");
-            ObjectIntMap<String> packageIndexes = generatePackageMetadata(classes, classesRequiringName);
+            ObjectIntMap<String> packageIndexes = generatePackageMetadata(classes, metadataRequirements);
             writer.append("]);").newLine();
 
             for (int i = 0; i < classes.size(); i += 50) {
                 int j = Math.min(i + 50, classes.size());
-                renderClassMetadataPortion(classes.subList(i, j), packageIndexes, classesRequiringName);
+                renderClassMetadataPortion(classes.subList(i, j), packageIndexes, metadataRequirements);
             }
 
         } catch (IOException e) {
@@ -497,7 +496,7 @@ public class Renderer implements RenderingManager {
     }
 
     private void renderClassMetadataPortion(List<PreparedClass> classes, ObjectIntMap<String> packageIndexes,
-            Set<String> classesRequiringName) throws IOException {
+            ClassMetadataRequirements metadataRequirements) throws IOException {
         writer.append("$rt_metadata([");
         boolean first = true;
         for (PreparedClass cls : classes) {
@@ -508,7 +507,8 @@ public class Renderer implements RenderingManager {
             debugEmitter.emitClass(cls.getName());
             writer.appendClass(cls.getName()).append(",").ws();
 
-            if (classesRequiringName.contains(cls.getName())) {
+            ClassMetadataRequirements.Info requiredMetadata = metadataRequirements.getInfo(cls.getName());
+            if (requiredMetadata.name()) {
                 String className = cls.getName();
                 int dotIndex = className.lastIndexOf('.') + 1;
                 String packageName = className.substring(0, dotIndex);
@@ -540,6 +540,33 @@ public class Renderer implements RenderingManager {
             writer.append(ElementModifier.pack(cls.getClassHolder().getModifiers())).append(',').ws();
             writer.append(cls.getClassHolder().getLevel().ordinal()).append(',').ws();
 
+            if (!requiredMetadata.enclosingClass() && !requiredMetadata.declaringClass()
+                    && !requiredMetadata.simpleName()) {
+                writer.append("0");
+            } else {
+                writer.append('[');
+                if (requiredMetadata.enclosingClass() && cls.getClassHolder().getOwnerName() != null) {
+                    writer.appendClass(cls.getClassHolder().getOwnerName());
+                } else {
+                    writer.append('0');
+                }
+                writer.append(',');
+                if (requiredMetadata.declaringClass() && cls.getClassHolder().getDeclaringClassName() != null) {
+                    writer.appendClass(cls.getClassHolder().getDeclaringClassName());
+                } else {
+                    writer.append('0');
+                }
+                writer.append(',');
+                if (requiredMetadata.simpleName() && cls.getClassHolder().getSimpleName() != null) {
+                    writer.append("\"").append(RenderingUtil.escapeString(cls.getClassHolder().getSimpleName()))
+                            .append("\"");
+                } else {
+                    writer.append('0');
+                }
+                writer.append(']');
+            }
+            writer.append(",").ws();
+
             MethodReader clinit = classSource.get(cls.getName()).getMethod(CLINIT_METHOD);
             if (clinit != null && context.isDynamicInitializer(cls.getName())) {
                 writer.appendClassInit(cls.getName());
@@ -562,13 +589,14 @@ public class Renderer implements RenderingManager {
         writer.append("]);").newLine();
     }
 
-    private ObjectIntMap<String> generatePackageMetadata(List<PreparedClass> classes, Set<String> classesRequiringName)
-            throws IOException {
+    private ObjectIntMap<String> generatePackageMetadata(List<PreparedClass> classes,
+            ClassMetadataRequirements metadataRequirements) throws IOException {
         PackageNode root = new PackageNode(null);
 
         for (PreparedClass classNode : classes) {
             String className = classNode.getName();
-            if (!classesRequiringName.contains(className)) {
+            ClassMetadataRequirements.Info requiredMetadata = metadataRequirements.getInfo(className);
+            if (!requiredMetadata.name()) {
                 continue;
             }
 
@@ -625,22 +653,6 @@ public class Renderer implements RenderingManager {
         for (String part : parts) {
             node = node.children.computeIfAbsent(part, PackageNode::new);
         }
-    }
-
-    private Set<String> findClassesRequiringName() {
-        Set<String> classesRequiringName = new HashSet<>();
-        MethodDependencyInfo getNameMethod = context.getDependencyInfo().getMethod(
-                new MethodReference(Class.class, "getName", String.class));
-        if (getNameMethod != null) {
-            classesRequiringName.addAll(Arrays.asList(getNameMethod.getVariable(0).getClassValueNode().getTypes()));
-        }
-        MethodDependencyInfo getSimpleNameMethod = context.getDependencyInfo().getMethod(
-                new MethodReference(Class.class, "getSimpleName", String.class));
-        if (getSimpleNameMethod != null) {
-            classesRequiringName.addAll(Arrays.asList(
-                    getSimpleNameMethod.getVariable(0).getClassValueNode().getTypes()));
-        }
-        return classesRequiringName;
     }
 
     private void collectMethodsToCopyFromInterfaces(ClassReader cls, List<MethodReference> targetList) {
@@ -972,16 +984,14 @@ public class Renderer implements RenderingManager {
                 }
                 variableNames.add(context.pointerName());
                 variableNames.add(context.tempVarName());
-                if (!variableNames.isEmpty()) {
-                    writer.append("var ");
-                    for (int i = 0; i < variableNames.size(); ++i) {
-                        if (i > 0) {
-                            writer.append(",").ws();
-                        }
-                        writer.append(variableNames.get(i));
+                writer.append("var ");
+                for (int i = 0; i < variableNames.size(); ++i) {
+                    if (i > 0) {
+                        writer.append(",").ws();
                     }
-                    writer.append(";").softNewLine();
+                    writer.append(variableNames.get(i));
                 }
+                writer.append(";").softNewLine();
 
                 int firstToSave = 0;
                 if (methodNode.getModifiers().contains(ElementModifier.STATIC)) {

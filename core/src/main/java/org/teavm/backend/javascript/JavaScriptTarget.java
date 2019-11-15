@@ -95,6 +95,9 @@ import org.teavm.model.instructions.InvocationType;
 import org.teavm.model.instructions.InvokeInstruction;
 import org.teavm.model.instructions.RaiseInstruction;
 import org.teavm.model.instructions.StringConstantInstruction;
+import org.teavm.model.transformation.BoundCheckInsertion;
+import org.teavm.model.transformation.NullCheckFilter;
+import org.teavm.model.transformation.NullCheckInsertion;
 import org.teavm.model.util.AsyncMethodFinder;
 import org.teavm.model.util.ProgramUtils;
 import org.teavm.vm.BuildTarget;
@@ -126,6 +129,9 @@ public class JavaScriptTarget implements TeaVMTarget, TeaVMJavaScriptHost {
     private List<VirtualMethodContributor> customVirtualMethods = new ArrayList<>();
     private int topLevelNameLimit = 10000;
     private AstDependencyExtractor dependencyExtractor = new AstDependencyExtractor();
+    private boolean strict;
+    private BoundCheckInsertion boundCheckInsertion = new BoundCheckInsertion();
+    private NullCheckInsertion nullCheckInsertion = new NullCheckInsertion(NullCheckFilter.EMPTY);
 
     @Override
     public List<ClassHolderTransformer> getTransformers() {
@@ -207,6 +213,10 @@ public class JavaScriptTarget implements TeaVMTarget, TeaVMJavaScriptHost {
         this.topLevelNameLimit = topLevelNameLimit;
     }
 
+    public void setStrict(boolean strict) {
+        this.strict = strict;
+    }
+
     @Override
     public boolean requiresRegisterAllocation() {
         return true;
@@ -274,6 +284,19 @@ public class JavaScriptTarget implements TeaVMTarget, TeaVMJavaScriptHost {
         exceptionCons.getVariable(1).propagate(stringType);
         exceptionCons.use();
 
+        if (strict) {
+            exceptionCons = dependencyAnalyzer.linkMethod(new MethodReference(
+                    ArrayIndexOutOfBoundsException.class, "<init>", void.class));
+            exceptionCons.getVariable(0).propagate(dependencyAnalyzer.getType(
+                    ArrayIndexOutOfBoundsException.class.getName()));
+            exceptionCons.use();
+
+            exceptionCons = dependencyAnalyzer.linkMethod(new MethodReference(
+                    NullPointerException.class, "<init>", void.class));
+            exceptionCons.getVariable(0).propagate(dependencyAnalyzer.getType(NullPointerException.class.getName()));
+            exceptionCons.use();
+        }
+
         if (stackTraceIncluded) {
             includeStackTraceMethods(dependencyAnalyzer);
         }
@@ -324,6 +347,10 @@ public class JavaScriptTarget implements TeaVMTarget, TeaVMJavaScriptHost {
 
     @Override
     public void beforeOptimizations(Program program, MethodReader method) {
+        if (strict) {
+            boundCheckInsertion.transformProgram(program, method.getReference());
+            nullCheckInsertion.transformProgram(program, method.getReference());
+        }
     }
 
     @Override
@@ -470,15 +497,14 @@ public class JavaScriptTarget implements TeaVMTarget, TeaVMJavaScriptHost {
     }
 
     private List<PreparedClass> modelToAst(ListableClassHolderSource classes) {
-        AsyncMethodFinder asyncFinder = new AsyncMethodFinder(controller.getDependencyInfo().getCallGraph(),
-                controller.getDiagnostics());
+        AsyncMethodFinder asyncFinder = new AsyncMethodFinder(controller.getDependencyInfo().getCallGraph());
         asyncFinder.find(classes);
         asyncMethods.addAll(asyncFinder.getAsyncMethods());
         asyncFamilyMethods.addAll(asyncFinder.getAsyncFamilyMethods());
         Set<MethodReference> splitMethods = new HashSet<>(asyncMethods);
         splitMethods.addAll(asyncFamilyMethods);
 
-        Decompiler decompiler = new Decompiler(classes, splitMethods, controller.isFriendlyToDebugger(), false);
+        Decompiler decompiler = new Decompiler(classes, splitMethods, controller.isFriendlyToDebugger());
 
         List<PreparedClass> classNodes = new ArrayList<>();
         for (String className : getClassOrdering(classes)) {
@@ -725,7 +751,7 @@ public class JavaScriptTarget implements TeaVMTarget, TeaVMJavaScriptHost {
     }
 
     private static SourceLocation map(TextLocation location) {
-        if (location == null) {
+        if (location == null || location.isEmpty()) {
             return null;
         }
         return new SourceLocation(location.getFileName(), location.getLine());

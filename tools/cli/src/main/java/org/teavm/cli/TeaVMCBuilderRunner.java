@@ -60,8 +60,24 @@ public class TeaVMCBuilderRunner {
                 .withLongOpt("min-heap")
                 .withArgName("size")
                 .hasArg()
-                .withDescription("Minimum heap size in bytes")
+                .withDescription("Minimum heap size in megabytes")
                 .create());
+        options.addOption(OptionBuilder
+                .withLongOpt("max-heap")
+                .withArgName("size")
+                .hasArg()
+                .withDescription("Minimum heap size in megabytes")
+                .create());
+        options.addOption(OptionBuilder
+                .withLongOpt("no-longjmp")
+                .withDescription("Don't use setjmp/longjmp functions to emulate exception handling")
+                .create());
+        options.addOption(OptionBuilder
+                .withLongOpt("entry-point")
+                .withArgName("name")
+                .hasArg()
+                .withDescription("Name of entry point function (main by default)")
+                .create('e'));
         options.addOption(OptionBuilder
                 .withLongOpt("external-tool")
                 .withArgName("path")
@@ -108,12 +124,18 @@ public class TeaVMCBuilderRunner {
 
         builder.setLog(new ConsoleTeaVMToolLog(commandLine.hasOption('v')));
         builder.setLineNumbersGenerated(commandLine.hasOption('g'));
+        if (commandLine.hasOption('e')) {
+            builder.setMainFunctionName(commandLine.getOptionValue('e'));
+        }
+        if (commandLine.hasOption("no-longjmp")) {
+            builder.setLongjmpSupported(false);
+        }
 
         String[] args = commandLine.getArgs();
         if (args.length != 1) {
             System.err.println("Unexpected arguments");
             printUsage();
-        } else if (args.length == 1) {
+        } else {
             builder.setMainClass(args[0]);
         }
     }
@@ -157,6 +179,18 @@ public class TeaVMCBuilderRunner {
                 return;
             }
             builder.setMinHeapSize(size);
+        }
+
+        if (commandLine.hasOption("max-heap")) {
+            int size;
+            try {
+                size = Integer.parseInt(commandLine.getOptionValue("max-heap"));
+            } catch (NumberFormatException e) {
+                System.err.print("Wrong heap size");
+                printUsage();
+                return;
+            }
+            builder.setMaxHeapSize(size);
         }
     }
 

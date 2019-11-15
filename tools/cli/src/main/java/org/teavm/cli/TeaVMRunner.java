@@ -135,11 +135,21 @@ public final class TeaVMRunner {
                 .withDescription("Minimum heap size in megabytes (for C and WebAssembly)")
                 .create());
         options.addOption(OptionBuilder
+                .withLongOpt("max-heap")
+                .withArgName("size")
+                .hasArg()
+                .withDescription("Maximum heap size in megabytes (for C and WebAssembly)")
+                .create());
+        options.addOption(OptionBuilder
                 .withLongOpt("max-toplevel-names")
                 .withArgName("number")
                 .hasArg()
                 .withDescription("Maximum number of names kept in top-level scope ("
                         + "other will be put in a separate object. 10000 by default.")
+                .create());
+        options.addOption(OptionBuilder
+                .withLongOpt("no-longjmp")
+                .withDescription("Don't use setjmp/longjmp functions to emulate exceptions (C target)")
                 .create());
     }
 
@@ -177,6 +187,7 @@ public final class TeaVMRunner {
         parseIncrementalOptions();
         parseJavaScriptOptions();
         parseWasmOptions();
+        parseCOptions();
         parseHeap();
 
         if (commandLine.hasOption("e")) {
@@ -313,6 +324,15 @@ public final class TeaVMRunner {
         }
     }
 
+    private void parseCOptions() {
+        if (commandLine.hasOption("no-longjmp")) {
+            tool.setLongjmpSupported(false);
+        }
+        if (commandLine.hasOption("heap-dump")) {
+            tool.setHeapDump(true);
+        }
+    }
+
     private void parseHeap() {
         if (commandLine.hasOption("min-heap")) {
             int size;
@@ -324,6 +344,17 @@ public final class TeaVMRunner {
                 return;
             }
             tool.setMinHeapSize(size * 1024 * 1024);
+        }
+        if (commandLine.hasOption("max-heap")) {
+            int size;
+            try {
+                size = Integer.parseInt(commandLine.getOptionValue("max-heap"));
+            } catch (NumberFormatException e) {
+                System.err.print("Wrong heap size");
+                printUsage();
+                return;
+            }
+            tool.setMaxHeapSize(size * 1024 * 1024);
         }
     }
 

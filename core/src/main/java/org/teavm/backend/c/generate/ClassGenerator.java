@@ -18,6 +18,7 @@ package org.teavm.backend.c.generate;
 import java.io.IOException;
 import java.lang.ref.ReferenceQueue;
 import java.lang.ref.WeakReference;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
@@ -40,6 +41,7 @@ import org.teavm.interop.Address;
 import org.teavm.interop.DelegateTo;
 import org.teavm.interop.NoGcRoot;
 import org.teavm.interop.Structure;
+import org.teavm.model.AccessLevel;
 import org.teavm.model.AnnotationHolder;
 import org.teavm.model.BasicBlock;
 import org.teavm.model.ClassHolder;
@@ -52,9 +54,11 @@ import org.teavm.model.Instruction;
 import org.teavm.model.ListableClassHolderSource;
 import org.teavm.model.MethodDescriptor;
 import org.teavm.model.MethodHolder;
+import org.teavm.model.MethodReader;
 import org.teavm.model.MethodReference;
 import org.teavm.model.Program;
 import org.teavm.model.ValueType;
+import org.teavm.model.analysis.ClassMetadataRequirements;
 import org.teavm.model.classes.TagRegistry;
 import org.teavm.model.classes.VirtualTable;
 import org.teavm.model.classes.VirtualTableEntry;
@@ -64,6 +68,7 @@ import org.teavm.model.instructions.ConstructArrayInstruction;
 import org.teavm.model.instructions.ConstructInstruction;
 import org.teavm.model.instructions.ConstructMultiArrayInstruction;
 import org.teavm.model.instructions.InstructionVisitor;
+import org.teavm.model.instructions.IsInstanceInstruction;
 import org.teavm.model.instructions.StringConstantInstruction;
 import org.teavm.model.lowlevel.CallSiteDescriptor;
 import org.teavm.model.lowlevel.Characteristics;
@@ -90,13 +95,17 @@ public class ClassGenerator {
     private FieldReference[] staticGcRoots;
     private FieldReference[] classLayout;
     private Set<ValueType> types = new LinkedHashSet<>();
+    private CodeWriter prologueWriter;
     private CodeWriter codeWriter;
     private CodeWriter initWriter;
     private CodeWriter headerWriter;
+    private CodeWriter callSitesWriter;
     private IncludeManager includes;
     private IncludeManager headerIncludes;
     private MethodNodeCache astCache = EmptyMethodNodeCache.INSTANCE;
     private AstDependencyExtractor dependencyExtractor = new AstDependencyExtractor();
+    private List<CallSiteDescriptor> callSites;
+    private ClassMetadataRequirements metadataRequirements;
 
     public ClassGenerator(GenerationContext context, TagRegistry tagRegistry, Decompiler decompiler,
             CacheStatus cacheStatus) {
@@ -104,10 +113,15 @@ public class ClassGenerator {
         this.tagRegistry = tagRegistry;
         this.decompiler = decompiler;
         this.cacheStatus = cacheStatus;
+        metadataRequirements = new ClassMetadataRequirements(context.getDependencies());
     }
 
     public void setAstCache(MethodNodeCache astCache) {
         this.astCache = astCache;
+    }
+
+    public void setCallSites(List<CallSiteDescriptor> callSites) {
+        this.callSites = callSites;
     }
 
     public void prepare(ListableClassHolderSource classes) {
@@ -171,6 +185,11 @@ public class ClassGenerator {
         }
 
         @Override
+        public void visit(IsInstanceInstruction insn) {
+            addType(insn.getType());
+        }
+
+        @Override
         public void visit(ConstructMultiArrayInstruction insn) {
             ValueType type = insn.getItemType();
             for (int i = 0; i < insn.getDimensions().size(); ++i) {
@@ -196,7 +215,7 @@ public class ClassGenerator {
     }
 
     private void generateCallSites(List<? extends CallSiteDescriptor> callSites, String callSitesName) {
-        CallSiteGenerator generator = new CallSiteGenerator(context, codeWriter, includes, callSitesName);
+        CallSiteGenerator generator = new CallSiteGenerator(context, callSitesWriter, includes, callSitesName);
         generator.setStatic(true);
         generator.generate(callSites);
     }
@@ -215,6 +234,7 @@ public class ClassGenerator {
 
         includes = new SimpleIncludeManager(writer);
         includes.init(fileName + ".c");
+        prologueWriter = writer.fragment();
         codeWriter = writer.fragment();
         this.headerWriter = headerWriter;
 
@@ -223,7 +243,7 @@ public class ClassGenerator {
         headerIncludes.init(fileName + ".h");
         headerIncludes.includePath("runtime.h");
 
-        codeGenerator = new CodeGenerator(context, codeWriter, includes);
+        String currentClassName = type instanceof ValueType.Object ? ((ValueType.Object) type).getClassName() : null;
 
         String sysInitializerName = context.getNames().forClassSystemInitializer(type);
         headerWriter.println("extern void " + sysInitializerName + "();");
@@ -231,6 +251,13 @@ public class ClassGenerator {
         initWriter = writer.fragment();
         writer.outdent().println("}");
         includes.includeType(type);
+
+        ClassGenerationContext classContext = new ClassGenerationContext(context, includes, prologueWriter,
+                initWriter, currentClassName);
+        codeGenerator = new CodeGenerator(classContext, codeWriter, includes);
+        if (context.isLongjmp() && !context.isIncremental()) {
+            codeGenerator.setCallSites(callSites);
+        }
     }
 
     private void generateStringPoolDecl(ValueType type) {
@@ -240,11 +267,14 @@ public class ClassGenerator {
 
         String poolName = "strings_" + context.getNames().forClassInstance(type);
         codeWriter.println("TeaVM_String* " + poolName + "[];");
+        codeWriter.println("#ifdef TEAVM_GET_STRING");
+        codeWriter.println("#undef TEAVM_GET_STRING");
+        codeWriter.println("#endif");
         codeWriter.println("#define TEAVM_GET_STRING(i) " + poolName + "[i]");
     }
 
     private void generateStringPool(ValueType type) {
-        if (!context.isIncremental()) {
+        if (!context.isIncremental() || context.getStringPool().getStrings().isEmpty()) {
             return;
         }
 
@@ -252,6 +282,7 @@ public class ClassGenerator {
 
         String poolName = "strings_" + context.getNames().forClassInstance(type);
         StringPoolGenerator poolGenerator = new StringPoolGenerator(context, poolName);
+        includes.includePath("stringhash.h");
         poolGenerator.generate(codeWriter);
         poolGenerator.generateStringPoolHeaders(initWriter, includes);
     }
@@ -261,37 +292,36 @@ public class ClassGenerator {
     }
 
     private void generateClassMethods(ClassHolder cls) {
+        boolean needsVirtualTable = needsVirtualTable(context.getCharacteristics(), ValueType.object(cls.getName()));
         for (MethodHolder method : cls.getMethods()) {
             if (method.hasModifier(ElementModifier.ABSTRACT)) {
                 continue;
             }
 
             if (method.hasModifier(ElementModifier.NATIVE)) {
-                if (!tryDelegateToMethod(cls, method)) {
-                    tryUsingGenerator(method);
+                if (tryDelegateToMethod(cls, method) || tryUsingGenerator(method)) {
+                    if (needsVirtualTable) {
+                        addToVirtualTable(method);
+                    }
                 }
                 continue;
             } else if (method.getProgram() == null) {
                 continue;
             }
 
+            if (needsVirtualTable) {
+                addToVirtualTable(method);
+            }
+
             if (context.isIncremental()) {
-                String callSitesName;
-                List<? extends CallSiteDescriptor> callSites = CallSiteDescriptor.extract(method.getProgram());
-                if (!callSites.isEmpty()) {
-                    callSitesName = "callsites_" + context.getNames().forMethod(method.getReference());
-                    includes.includeClass(CallSite.class.getName());
-                    generateCallSites(callSites, callSitesName);
-                } else {
-                    callSitesName = "NULL";
-                }
-                codeWriter.println("#define TEAVM_ALLOC_STACK(size) TEAVM_ALLOC_STACK_DEF(size, "
-                        + callSitesName + ")");
+                callSitesWriter = codeWriter.fragment();
             }
 
             generateMethodForwardDeclaration(method);
             RegularMethodNode methodNode;
-            AstCacheEntry entry = astCache.get(method.getReference(), cacheStatus);
+            AstCacheEntry entry = !cacheStatus.isStaleMethod(method.getReference())
+                    ? astCache.get(method.getReference(), cacheStatus)
+                    : null;
             if (entry == null) {
                 methodNode = decompiler.decompileRegular(method);
                 astCache.store(method.getReference(), new AstCacheEntry(methodNode, new ControlFlowEntry[0]),
@@ -300,19 +330,62 @@ public class ClassGenerator {
                 methodNode = entry.method;
             }
 
+            List<CallSiteDescriptor> callSites = null;
+            if (context.isLongjmp()) {
+                if (context.isIncremental()) {
+                    callSites = new ArrayList<>();
+                    codeGenerator.setCallSites(callSites);
+                }
+            }
+
             codeGenerator.generateMethod(methodNode);
 
             if (context.isIncremental()) {
+                generateCallSites(method.getReference(),
+                        context.isLongjmp() ? callSites : CallSiteDescriptor.extract(method.getProgram()));
                 codeWriter.println("#undef TEAVM_ALLOC_STACK");
             }
         }
     }
 
+    private void addToVirtualTable(MethodReader method) {
+        if (!context.isIncremental()) {
+            return;
+        }
+        if (method.hasModifier(ElementModifier.STATIC) || method.getLevel() == AccessLevel.PRIVATE
+                || method.getName().equals("<init>")) {
+            return;
+        }
+
+        String className = context.getNames().forClassInstance(ValueType.object(method.getOwnerName()));
+        String idVar = codeGenerator.getClassContext().getVirtualMethodId(method.getDescriptor());
+        initWriter.println("teavm_vc_registerMethod(&" + className + ", " + idVar + ", &"
+                + context.getNames().forMethod(method.getReference()) + ");");
+    }
+
     private void generateMethodForwardDeclaration(MethodHolder method) {
+        if (context.isIncremental()) {
+            codeGenerator.getClassContext().importMethod(method.getReference(),
+                    method.hasModifier(ElementModifier.STATIC));
+            return;
+        }
         boolean isStatic = method.hasModifier(ElementModifier.STATIC);
         headerWriter.print("extern ");
-        codeGenerator.generateMethodSignature(headerWriter, method.getReference(), isStatic, false);
+        CodeGenerator.generateMethodSignature(headerWriter, context.getNames(), method.getReference(), isStatic, false);
         headerWriter.println(";");
+    }
+
+    private void generateCallSites(MethodReference method, List<? extends CallSiteDescriptor> callSites) {
+        String callSitesName;
+        if (!callSites.isEmpty()) {
+            callSitesName = "callsites_" + context.getNames().forMethod(method);
+            includes.includeClass(CallSite.class.getName());
+            generateCallSites(callSites, callSitesName);
+        } else {
+            callSitesName = "NULL";
+        }
+        callSitesWriter.println("#define TEAVM_ALLOC_STACK(size) TEAVM_ALLOC_STACK_DEF(size, "
+                + callSitesName + ")");
     }
 
     private void generateInitializer(ClassHolder cls) {
@@ -456,16 +529,23 @@ public class ClassGenerator {
         String className = null;
         if (type instanceof ValueType.Object) {
             className = ((ValueType.Object) type).getClassName();
-            generateVirtualTableStructure(className);
+            if (!context.isIncremental()) {
+                generateVirtualTableStructure(className);
+            }
         } else if (type instanceof ValueType.Array) {
             className = "java.lang.Object";
         }
         ClassReader cls = className != null ? context.getClassSource().get(className) : null;
 
-        String structName = className != null && (cls == null || !cls.hasModifier(ElementModifier.INTERFACE))
-                ? context.getNames().forClassClass(className)
-                : "TeaVM_Class";
-        if (className != null) {
+        String structName;
+        if (context.isIncremental()) {
+            structName = className != null ? "TeaVM_DynamicClass" : "TeaVM_Class";
+        } else {
+            structName = className != null && (cls == null || !cls.hasModifier(ElementModifier.INTERFACE))
+                    ? context.getNames().forClassClass(className)
+                    : "TeaVM_Class";
+        }
+        if (className != null && !context.isIncremental()) {
             headerIncludes.includeClass(className);
         }
         String name = context.getNames().forClassInstance(type);
@@ -484,21 +564,58 @@ public class ClassGenerator {
         codeWriter.print("alignas(8) ").print(structName).print(" ").print(name).println(" = {").indent();
 
         if (className != null) {
-            VirtualTable virtualTable = context.getVirtualTableProvider().lookup(className);
-            if (cls.hasModifier(ElementModifier.INTERFACE)) {
-                generateRuntimeClassInitializer(type, enumConstants);
-            } else if (virtualTable != null) {
-                generateVirtualTableContent(virtualTable, virtualTable, type, enumConstants);
+            if (context.isIncremental()) {
+                generateDynamicVirtualTable(name, type, enumConstants);
             } else {
-                codeWriter.println(".parent = {").indent();
-                generateRuntimeClassInitializer(type, enumConstants);
-                codeWriter.outdent().println("}");
+                VirtualTable virtualTable = context.getVirtualTableProvider().lookup(className);
+                if (cls.hasModifier(ElementModifier.INTERFACE)) {
+                    generateRuntimeClassInitializer(type, enumConstants);
+                } else if (virtualTable != null) {
+                    generateVirtualTableContent(virtualTable, virtualTable, type, enumConstants);
+                } else {
+                    codeWriter.println(".parent = {").indent();
+                    generateRuntimeClassInitializer(type, enumConstants);
+                    codeWriter.outdent().println("}");
+                }
             }
         } else {
             generateRuntimeClassInitializer(type, enumConstants);
         }
 
         codeWriter.outdent().println("};");
+    }
+
+    private void generateDynamicVirtualTable(String name, ValueType type, String enumConstants) {
+        codeWriter.println(".parent = {").indent();
+        generateRuntimeClassInitializer(type, enumConstants);
+        codeWriter.outdent().println("}");
+
+        String[] parentClasses;
+        if (type instanceof ValueType.Object) {
+            String className = ((ValueType.Object) type).getClassName();
+            ClassReader cls = context.getClassSource().get(className);
+            if (cls != null) {
+                int count = cls.getInterfaces().size();
+                if (cls.getParent() != null) {
+                    count++;
+                }
+                parentClasses = new String[count];
+                cls.getInterfaces().toArray(parentClasses);
+                if (cls.getParent() != null) {
+                    parentClasses[count - 1] = cls.getParent();
+                }
+            } else {
+                parentClasses = new String[0];
+            }
+        } else {
+            parentClasses = new String[] { "java.lang.Object" };
+        }
+
+        for (String parentClass : parentClasses) {
+            includes.includeClass(parentClass);
+            String parentClassName = context.getNames().forClassInstance(ValueType.object(parentClass));
+            initWriter.println("teavm_vc_copyMethods(&" + parentClassName + ", &" + name + ");");
+        }
     }
 
     private void generateVirtualTableContent(VirtualTable current, VirtualTable original, ValueType type,
@@ -553,6 +670,9 @@ public class ClassGenerator {
         String initFunction = "NULL";
         String superinterfaceCount = "0";
         String superinterfaces = "NULL";
+        String simpleName = null;
+        String declaringClass = "NULL";
+        String enclosingClass = "NULL";
 
         if (type instanceof ValueType.Object) {
             String className = ((ValueType.Object) type).getClassName();
@@ -568,10 +688,15 @@ public class ClassGenerator {
             } else {
                 sizeExpr = "0";
             }
-            if (cls != null && cls.hasModifier(ElementModifier.ENUM)) {
-                flags |= RuntimeClass.ENUM;
+            if (cls != null) {
+                if (cls.hasModifier(ElementModifier.ENUM)) {
+                    flags |= RuntimeClass.ENUM;
+                }
+                if (cls.hasModifier(ElementModifier.SYNTHETIC)) {
+                    flags |= RuntimeClass.SYNTHETIC;
+                }
             }
-            List<TagRegistry.Range> ranges = tagRegistry.getRanges(className);
+            List<TagRegistry.Range> ranges = tagRegistry != null ? tagRegistry.getRanges(className) : null;
             tag = !context.isIncremental() && ranges != null && !ranges.isEmpty() ? ranges.get(0).lower : 0;
 
             if (cls != null && cls.getParent() != null && types.contains(ValueType.object(cls.getParent()))) {
@@ -616,6 +741,24 @@ public class ClassGenerator {
                     break;
             }
 
+            if (cls != null) {
+                simpleName = cls.getSimpleName();
+
+                if (cls.getDeclaringClassName() != null
+                        && context.getDependencies().getClass(cls.getDeclaringClassName()) != null) {
+                    declaringClass = "(TeaVM_Class*) &" + context.getNames().forClassInstance(
+                            ValueType.object(cls.getDeclaringClassName()));
+                    includes.includeClass(cls.getDeclaringClassName());
+                }
+
+                if (cls.getOwnerName() != null
+                        && context.getDependencies().getClass(cls.getOwnerName()) != null) {
+                    enclosingClass = "(TeaVM_Class*) &" + context.getNames().forClassInstance(
+                            ValueType.object(cls.getOwnerName()));
+                    includes.includeClass(cls.getOwnerName());
+                }
+            }
+
         } else if (type instanceof ValueType.Array) {
             includes.includeClass("java.lang.Object");
             parent = "(TeaVM_Class*) &" + context.getNames().forClassInstance(ValueType.object("java.lang.Object"));
@@ -629,16 +772,21 @@ public class ClassGenerator {
             tag = 0;
             sizeExpr = "0";
             itemTypeExpr = "NULL";
+            flags |= RuntimeClass.PRIMITIVE;
+            flags = ClassGeneratorUtil.applyPrimitiveFlags(flags, type);
         } else {
             parent = "NULL";
-            tag = 0;
+            tag = Integer.MAX_VALUE;
             sizeExpr = "sizeof(" + CodeWriter.strictTypeAsString(type) + ")";
             flags |= RuntimeClass.PRIMITIVE;
             flags = ClassGeneratorUtil.applyPrimitiveFlags(flags, type);
             itemTypeExpr = "NULL";
         }
 
-        int nameRef = context.getStringPool().getStringIndex(nameOfType(type));
+        String metadataName = nameOfType(type);
+        String nameRef = metadataName != null
+                ? "(TeaVM_Object**) &TEAVM_GET_STRING(" + context.getStringPool().getStringIndex(metadataName) + ")"
+                : "NULL";
         String superTypeFunction = context.getNames().forSupertypeFunction(type);
 
         ValueType arrayType = ValueType.arrayOf(type);
@@ -650,13 +798,20 @@ public class ClassGenerator {
             arrayTypeExpr = "NULL";
         }
 
+        if (simpleName == null) {
+            simpleName = "NULL";
+        } else {
+            int simpleNameIndex = context.getStringPool().getStringIndex(simpleName);
+            simpleName = "(TeaVM_Object**) &TEAVM_GET_STRING(" + simpleNameIndex + ")";
+        }
+
         includes.includePath("strings.h");
         codeWriter.println(".size = " + sizeExpr + ",");
         codeWriter.println(".flags = " + flags + ",");
         codeWriter.println(".tag = " + tag + ",");
         codeWriter.println(".canary = 0,");
-        codeWriter.println(".name = (TeaVM_Object**) &TEAVM_GET_STRING(" + nameRef + "),");
-        codeWriter.println(".simpleName = NULL,");
+        codeWriter.println(".name = " + nameRef + ",");
+        codeWriter.println(".simpleName = " + simpleName + ",");
         codeWriter.println(".arrayType = " + arrayTypeExpr + ",");
         codeWriter.println(".itemType = " + itemTypeExpr + ",");
         codeWriter.println(".isSupertypeOf = &" + superTypeFunction + ",");
@@ -665,7 +820,169 @@ public class ClassGenerator {
         codeWriter.println(".superinterfaces = " + superinterfaces + ",");
         codeWriter.println(".layout = " + layout + ",");
         codeWriter.println(".enumValues = " + enumConstants + ",");
-        codeWriter.println(".init = " + initFunction);
+        codeWriter.println(".declaringClass = " + declaringClass + ",");
+        codeWriter.println(".enclosingClass = " + enclosingClass + ",");
+        codeWriter.print(".init = " + initFunction);
+
+        if (context.isHeapDump() && type instanceof ValueType.Object) {
+            ClassReader cls = context.getClassSource().get(((ValueType.Object) type).getClassName());
+            generateHeapDumpMetadata(cls);
+        }
+        codeWriter.println();
+    }
+
+    private void generateHeapDumpMetadata(ClassReader cls) {
+        List<HeapDumpField> fields = getHeapDumpFields(cls);
+        List<HeapDumpField> staticFields = getHeapDumpStaticFields(cls);
+        if (staticFields.isEmpty() && fields.isEmpty()) {
+            return;
+        }
+        codeWriter.println().println("#if TEAVM_HEAP_DUMP").indent();
+        if (!fields.isEmpty()) {
+            codeWriter.println(",");
+            codeWriter.println(".fieldDescriptors = (TeaVM_FieldDescriptors*) "
+                    + "&(struct { uint32_t count; TeaVM_FieldDescriptor data["
+                    + fields.size() + "]; }) {").indent();
+            generateHeapDumpFields(fields);
+            codeWriter.outdent().print("}");
+        }
+        if (!staticFields.isEmpty()) {
+            codeWriter.println(",");
+            codeWriter.println(".staticFieldDescriptors = (TeaVM_StaticFieldDescriptors*) "
+                    + "&(struct { uint32_t count; TeaVM_StaticFieldDescriptor data["
+                    + staticFields.size() + "]; }) {").indent();
+            generateHeapDumpFields(staticFields);
+            codeWriter.outdent().print("}");
+        }
+        codeWriter.println().outdent().println("#endif");
+    }
+
+    private void generateHeapDumpFields(List<HeapDumpField> fields) {
+        codeWriter.println(".count = " + fields.size() + ",");
+        codeWriter.println(".data = {").indent();
+        for (int i = 0; i < fields.size(); ++i) {
+            if (i > 0) {
+                codeWriter.println(",");
+            }
+            HeapDumpField field = fields.get(i);
+            codeWriter.print("{ .name = u");
+            StringPoolGenerator.generateSimpleStringLiteral(codeWriter, field.name);
+            codeWriter.print(", .offset = " + field.offset + ", .type = " + field.type + " }");
+        }
+        codeWriter.println().outdent().println("}");
+    }
+
+    private static final String TYPE_OBJECT = "TEAVM_FIELD_TYPE_OBJECT";
+
+    private List<HeapDumpField> getHeapDumpFields(ClassReader cls) {
+        List<HeapDumpField> fields = new ArrayList<>();
+        switch (cls.getName()) {
+            case "java.lang.Object":
+            case "java.lang.ref.ReferenceQueue":
+            case "java.lang.ref.WeakReference":
+            case "java.lang.ref.SoftReference":
+                break;
+            case "java.lang.Class":
+                fields.add(new HeapDumpField("name", "offsetof(TeaVM_Class, name)", TYPE_OBJECT));
+                fields.add(new HeapDumpField("simpleName", "offsetof(TeaVM_Class, simpleName)", TYPE_OBJECT));
+                break;
+            case "java.lang.ref.Reference":
+                fields.add(new HeapDumpField("referent", "offsetof(TeaVM_Reference, object)", TYPE_OBJECT));
+                fields.add(new HeapDumpField("queue", "offsetof(TeaVM_Reference, queue)", TYPE_OBJECT));
+                break;
+            default: {
+                for (FieldReader field : cls.getFields()) {
+                    if (field.hasModifier(ElementModifier.STATIC) || !isManaged(field)) {
+                        continue;
+                    }
+                    String className = context.getNames().forClass(cls.getName());
+                    String offset = "offsetof(" + className + ", "
+                            + context.getNames().forMemberField(field.getReference()) + ")";
+                    fields.add(new HeapDumpField(field.getName(), offset, typeForHeapDump(field.getType())));
+                }
+                break;
+            }
+        }
+        return fields;
+    }
+
+    private List<HeapDumpField> getHeapDumpStaticFields(ClassReader cls) {
+        List<HeapDumpField> fields = new ArrayList<>();
+        switch (cls.getName()) {
+            case "java.lang.Object":
+            case "java.lang.Class":
+            case "java.lang.ref.ReferenceQueue":
+            case "java.lang.ref.Reference":
+            case "java.lang.ref.WeakReference":
+            case "java.lang.ref.SoftReference":
+                break;
+            default: {
+                for (FieldReader field : cls.getFields()) {
+                    if (!field.hasModifier(ElementModifier.STATIC) || !isManaged(field)) {
+                        continue;
+                    }
+                    String offset = "(unsigned char*) &" + context.getNames().forStaticField(field.getReference());
+                    fields.add(new HeapDumpField(field.getName(), offset, typeForHeapDump(field.getType())));
+                }
+                break;
+            }
+        }
+        return fields;
+    }
+
+    private boolean isManaged(FieldReader field) {
+        ValueType type = field.getType();
+        return !(type instanceof ValueType.Object)
+                || context.getCharacteristics().isManaged(((ValueType.Object) type).getClassName());
+    }
+
+    static String typeForHeapDump(ValueType type) {
+        String result = "127";
+        if (type instanceof ValueType.Primitive) {
+            switch (((ValueType.Primitive) type).getKind()) {
+                case BOOLEAN:
+                    result = "TEAVM_FIELD_TYPE_BOOLEAN";
+                    break;
+                case BYTE:
+                    result = "TEAVM_FIELD_TYPE_BYTE";
+                    break;
+                case SHORT:
+                    result = "TEAVM_FIELD_TYPE_SHORT";
+                    break;
+                case CHARACTER:
+                    result = "TEAVM_FIELD_TYPE_CHAR";
+                    break;
+                case INTEGER:
+                    result = "TEAVM_FIELD_TYPE_INT";
+                    break;
+                case FLOAT:
+                    result = "TEAVM_FIELD_TYPE_FLOAT";
+                    break;
+                case LONG:
+                    result = "TEAVM_FIELD_TYPE_LONG";
+                    break;
+                case DOUBLE:
+                    result = "TEAVM_FIELD_TYPE_DOUBLE";
+                    break;
+            }
+        } else if (type instanceof ValueType.Array) {
+            result = "TEAVM_FIELD_TYPE_ARRAY";
+        } else {
+            result = "TEAVM_FIELD_TYPE_OBJECT";
+        }
+        return result;
+    }
+
+    static class HeapDumpField {
+        String name;
+        String offset;
+        String type;
+
+        HeapDumpField(String name, String offset, String type) {
+            this.name = name;
+            this.offset = offset;
+            this.type = type;
+        }
     }
 
     private void generateVirtualTableStructure(String className) {
@@ -690,7 +1007,7 @@ public class ClassGenerator {
                     String methodName = context.getNames().forVirtualMethod(method);
                     headerWriter.printType(method.getResultType())
                             .print(" (*").print(methodName).print(")(");
-                    codeGenerator.generateMethodParameters(headerWriter, method, false, false);
+                    CodeGenerator.generateMethodParameters(headerWriter, method, false, false);
                     headerWriter.print(")");
                 } else {
                     headerWriter.print("void (*pad" + padIndex++ + ")()");
@@ -768,10 +1085,7 @@ public class ClassGenerator {
     public static boolean needsVirtualTable(Characteristics characteristics, ValueType type) {
         if (type instanceof ValueType.Object) {
             String className = ((ValueType.Object) type).getClassName();
-            if (className.equals(Address.class.getName())) {
-                return false;
-            }
-            return !characteristics.isStructure(className);
+            return characteristics.isManaged(className);
         } else if (type instanceof ValueType.Array) {
             return needsVirtualTable(characteristics, ((ValueType.Array) type).getItemType());
         } else {
@@ -782,7 +1096,8 @@ public class ClassGenerator {
     private boolean needsInitializer(ClassReader cls) {
         return !context.getCharacteristics().isStaticInit(cls.getName())
                 && !context.getCharacteristics().isStructure(cls.getName())
-                && cls.getMethod(new MethodDescriptor("<clinit>", ValueType.VOID)) != null;
+                && cls.getMethod(new MethodDescriptor("<clinit>", ValueType.VOID)) != null
+                && context.getClassInitializerInfo().isDynamicInitializer(cls.getName());
     }
 
     private boolean tryDelegateToMethod(ClassHolder cls, MethodHolder method) {
@@ -804,7 +1119,7 @@ public class ClassGenerator {
     }
 
     private void delegateToMethod(MethodHolder callingMethod, MethodHolder delegateMethod) {
-        codeGenerator.generateMethodSignature(codeWriter, callingMethod.getReference(),
+        CodeGenerator.generateMethodSignature(codeWriter, context.getNames(), callingMethod.getReference(),
                 callingMethod.hasModifier(ElementModifier.STATIC), true);
         codeWriter.println(" {").indent();
 
@@ -834,32 +1149,34 @@ public class ClassGenerator {
         codeWriter.outdent().println("}");
     }
 
-    private void tryUsingGenerator(MethodHolder method) {
+    private boolean tryUsingGenerator(MethodHolder method) {
         MethodReference methodRef = method.getReference();
         Generator generator = context.getGenerator(methodRef);
         if (generator == null) {
-            return;
+            return false;
         }
 
         generateMethodForwardDeclaration(method);
         CodeWriter writerBefore = codeWriter.fragment();
         boolean isStatic = method.hasModifier(ElementModifier.STATIC);
-        codeGenerator.generateMethodSignature(codeWriter, methodRef, isStatic, true);
+        CodeGenerator.generateMethodSignature(codeWriter, context.getNames(), methodRef, isStatic, true);
         codeWriter.println(" {").indent();
         CodeWriter bodyWriter = codeWriter.fragment();
         codeWriter.outdent().println("}");
 
-        GeneratorContextImpl generatorContext = new GeneratorContextImpl(context, bodyWriter, writerBefore,
-                codeWriter, includes);
+        GeneratorContextImpl generatorContext = new GeneratorContextImpl(codeGenerator.getClassContext(),
+                bodyWriter, writerBefore, codeWriter, includes);
         generator.generate(generatorContext, methodRef);
         try {
             generatorContext.flush();
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
+
+        return true;
     }
 
-    public static String nameOfType(ValueType type) {
+    public String nameOfType(ValueType type) {
         if (type instanceof ValueType.Primitive) {
             switch (((ValueType.Primitive) type).getKind()) {
                 case BOOLEAN:
@@ -882,14 +1199,26 @@ public class ClassGenerator {
                     throw new AssertionError();
             }
         } else if (type instanceof ValueType.Array) {
-            return nameOfType(((ValueType.Array) type).getItemType()) + "[]";
+            if (isArrayOfPrimitives(type)) {
+                return type.toString().replace('/', '.');
+            } else {
+                return null;
+            }
         } else if (type == ValueType.VOID) {
             return "void";
         } else if (type instanceof ValueType.Object) {
-            return ((ValueType.Object) type).getClassName();
+            String name = ((ValueType.Object) type).getClassName();
+            return metadataRequirements.getInfo(name).name() ? name : null;
         } else {
             throw new AssertionError();
         }
+    }
+
+    private static boolean isArrayOfPrimitives(ValueType type) {
+        while (type instanceof ValueType.Array) {
+            type = ((ValueType.Array) type).getItemType();
+        }
+        return type instanceof ValueType.Primitive || type == ValueType.VOID;
     }
 
     private void generateIsSupertypeFunction(ValueType type) {

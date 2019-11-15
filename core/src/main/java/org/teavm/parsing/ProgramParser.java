@@ -93,7 +93,6 @@ import org.teavm.model.instructions.StringConstantInstruction;
 import org.teavm.model.instructions.SwitchInstruction;
 import org.teavm.model.instructions.SwitchTableEntry;
 import org.teavm.model.instructions.UnwrapArrayInstruction;
-import org.teavm.model.util.ProgramUtils;
 import org.teavm.model.util.TransitionExtractor;
 
 public class ProgramParser {
@@ -185,8 +184,6 @@ public class ProgramParser {
         while (program.variableCount() <= signatureVars) {
             program.createVariable();
         }
-        program.basicBlockAt(0).getTryCatchBlocks().addAll(ProgramUtils.copyTryCatches(
-                program.basicBlockAt(1), program));
         return program;
     }
 
@@ -335,7 +332,7 @@ public class ProgramParser {
         BasicBlock basicBlock = null;
         Map<Integer, String> accumulatedDebugNames = new HashMap<>();
         Integer lastLineNumber = null;
-        TextLocation lastLocation = null;
+        TextLocation lastLocation = TextLocation.EMPTY;
         for (int i = 0; i < basicBlocks.size(); ++i) {
             BasicBlock newBasicBlock = basicBlocks.get(i);
             if (newBasicBlock != null) {
@@ -881,13 +878,7 @@ public class ProgramParser {
         @Override
         public void visitIntInsn(int opcode, int operand) {
             switch (opcode) {
-                case Opcodes.BIPUSH: {
-                    IntegerConstantInstruction insn = new IntegerConstantInstruction();
-                    insn.setConstant(operand);
-                    insn.setReceiver(getVariable(pushSingle()));
-                    addInstruction(insn);
-                    break;
-                }
+                case Opcodes.BIPUSH:
                 case Opcodes.SIPUSH: {
                     IntegerConstantInstruction insn = new IntegerConstantInstruction();
                     insn.setConstant(operand);

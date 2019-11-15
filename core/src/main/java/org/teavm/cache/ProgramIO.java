@@ -19,11 +19,13 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.List;
+import java.util.Objects;
 import org.teavm.model.BasicBlock;
 import org.teavm.model.BasicBlockReader;
 import org.teavm.model.FieldReference;
 import org.teavm.model.Incoming;
 import org.teavm.model.IncomingReader;
+import org.teavm.model.InliningInfo;
 import org.teavm.model.Instruction;
 import org.teavm.model.InvokeDynamicInstruction;
 import org.teavm.model.MethodDescriptor;
@@ -48,6 +50,7 @@ import org.teavm.model.instructions.BinaryBranchingCondition;
 import org.teavm.model.instructions.BinaryBranchingInstruction;
 import org.teavm.model.instructions.BinaryInstruction;
 import org.teavm.model.instructions.BinaryOperation;
+import org.teavm.model.instructions.BoundCheckInstruction;
 import org.teavm.model.instructions.BranchingCondition;
 import org.teavm.model.instructions.BranchingInstruction;
 import org.teavm.model.instructions.CastInstruction;
@@ -205,26 +208,39 @@ public class ProgramIO {
                 block.getTryCatchBlocks().add(tryCatch);
             }
 
-            TextLocation location = null;
+            InliningInfo inliningInfo = null;
+            TextLocation location = TextLocation.EMPTY;
             insnLoop: while (true) {
                 int insnType = data.readUnsigned();
                 switch (insnType) {
                     case 0:
                         break insnLoop;
                     case 1:
-                        location = null;
+                        location = new TextLocation(null, -1, inliningInfo);
                         break;
                     case 2: {
                         String file = fileTable.at(data.readUnsigned());
                         int line = data.readUnsigned();
-                        location = new TextLocation(file, line);
+                        location = new TextLocation(file, line, inliningInfo);
                         break;
                     }
                     case 127: {
                         int line = location.getLine() + data.readSigned();
-                        location = new TextLocation(location.getFileName(), line);
+                        location = new TextLocation(location.getFileName(), line, inliningInfo);
                         break;
                     }
+                    case 125: {
+                        String className = symbolTable.at(data.readUnsigned());
+                        MethodDescriptor methodDescriptor = parseMethodDescriptor(symbolTable.at(data.readUnsigned()));
+                        inliningInfo = new InliningInfo(createMethodReference(className, methodDescriptor),
+                                location.getFileName(), location.getLine(), inliningInfo);
+                        location = new TextLocation(null, -1, inliningInfo);
+                        break;
+                    }
+                    case 126:
+                        location = new TextLocation(inliningInfo.getFileName(), inliningInfo.getLine());
+                        inliningInfo = inliningInfo.getParent();
+                        break;
                     default: {
                         Instruction insn = readInstruction(insnType, program, data);
                         insn.setLocation(location);
@@ -240,7 +256,7 @@ public class ProgramIO {
 
     private class InstructionWriter implements InstructionReader {
         private VarDataOutput output;
-        TextLocation location;
+        TextLocation location = TextLocation.EMPTY;
 
         InstructionWriter(VarDataOutput output) {
             this.output = output;
@@ -249,22 +265,66 @@ public class ProgramIO {
         @Override
         public void location(TextLocation newLocation) {
             try {
-                if (newLocation == null || newLocation.getFileName() == null || newLocation.getLine() < 0) {
-                    output.writeUnsigned(1);
-                    location = null;
-                } else {
-                    if (location != null && location.getFileName().equals(newLocation.getFileName())) {
-                        output.writeUnsigned(127);
-                        output.writeSigned(newLocation.getLine() - location.getLine());
-                    } else {
-                        output.writeUnsigned(2);
-                        output.writeUnsigned(fileTable.lookup(newLocation.getFileName()));
-                        output.writeUnsigned(newLocation.getLine());
-                    }
-                    location = newLocation;
+                if (newLocation == null) {
+                    newLocation = TextLocation.EMPTY;
                 }
+
+                String fileName = location.getFileName();
+                int lineNumber = location.getLine();
+
+                if (newLocation.getInlining() != location.getInlining()) {
+                    InliningInfo lastCommonInlining = null;
+                    InliningInfo[] prevPath = location.getInliningPath();
+                    InliningInfo[] newPath = newLocation.getInliningPath();
+                    int pathIndex = 0;
+                    while (pathIndex < prevPath.length && pathIndex < newPath.length
+                            && prevPath[pathIndex].equals(newPath[pathIndex])) {
+                        lastCommonInlining = prevPath[pathIndex++];
+                    }
+
+                    InliningInfo prevInlining = location.getInlining();
+                    while (prevInlining != lastCommonInlining) {
+                        output.writeUnsigned(126);
+                        fileName = prevInlining.getFileName();
+                        lineNumber = prevInlining.getLine();
+                        prevInlining = prevInlining.getParent();
+                    }
+
+                    while (pathIndex < newPath.length) {
+                        InliningInfo inlining = newPath[pathIndex++];
+                        writeSimpleLocation(fileName, lineNumber, inlining.getFileName(), inlining.getLine());
+                        fileName = null;
+                        lineNumber = -1;
+
+                        output.writeUnsigned(125);
+                        MethodReference method = inlining.getMethod();
+                        output.writeUnsigned(symbolTable.lookup(method.getClassName()));
+                        output.writeUnsigned(symbolTable.lookup(method.getDescriptor().toString()));
+                    }
+                }
+
+                writeSimpleLocation(fileName, lineNumber, newLocation.getFileName(), newLocation.getLine());
+                location = newLocation;
             } catch (IOException e) {
                 throw new IOExceptionWrapper(e);
+            }
+        }
+
+        private void writeSimpleLocation(String fileName, int lineNumber, String newFileName, int newLineNumber)
+                throws IOException {
+            if (Objects.equals(fileName, newFileName) && lineNumber == newLineNumber) {
+                return;
+            }
+
+            if (newFileName == null) {
+                output.writeUnsigned(1);
+            } else if (fileName != null && fileName.equals(newFileName)) {
+                output.writeUnsigned(127);
+                output.writeSigned(newLineNumber - lineNumber);
+            } else {
+                output.writeUnsigned(2);
+                output.writeUnsigned(fileTable.lookup(newFileName));
+                output.writeUnsigned(newLineNumber);
             }
         }
 
@@ -738,6 +798,20 @@ public class ProgramIO {
             }
         }
 
+        @Override
+        public void boundCheck(VariableReader receiver, VariableReader index, VariableReader array, boolean lower) {
+            try {
+                output.writeUnsigned(array == null ? 89 : !lower ? 88 : 87);
+                output.writeUnsigned(receiver.getIndex());
+                output.writeUnsigned(index.getIndex());
+                if (array != null) {
+                    output.writeUnsigned(array.getIndex());
+                }
+            } catch (IOException e) {
+                throw new IOExceptionWrapper(e);
+            }
+        }
+
         private void write(MethodHandle handle) throws IOException {
             switch (handle.getKind()) {
                 case GET_FIELD:
@@ -1203,6 +1277,18 @@ public class ProgramIO {
                 for (int i = 0; i < bootstrapArgsCount; ++i) {
                     insn.getBootstrapArguments().add(readRuntimeConstant(input));
                 }
+                return insn;
+            }
+            case 87:
+            case 88:
+            case 89: {
+                BoundCheckInstruction insn = new BoundCheckInstruction();
+                insn.setReceiver(program.variableAt(input.readUnsigned()));
+                insn.setIndex(program.variableAt(input.readUnsigned()));
+                if (insnType != 89) {
+                    insn.setArray(program.variableAt(input.readUnsigned()));
+                }
+                insn.setLower(insnType != 88);
                 return insn;
             }
             default:

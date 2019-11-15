@@ -24,7 +24,7 @@ function $rt_nextId() {
     return x;
 }
 function $rt_compare(a, b) {
-    return a > b ? 1 : a < b ? -1 : 0;
+    return a > b ? 1 : a < b ? -1 : a === b ? 0 : 1;
 }
 function $rt_isInstance(obj, cls) {
     return obj !== null && !!obj.constructor.$meta && $rt_isAssignable(obj.constructor, cls);
@@ -32,6 +32,9 @@ function $rt_isInstance(obj, cls) {
 function $rt_isAssignable(from, to) {
     if (from === to) {
         return true;
+    }
+    if (to.$meta.item !== null) {
+        return from.$meta.item !== null && $rt_isAssignable(from.$meta.item, to.$meta.item);
     }
     var supertypes = from.$meta.supertypes;
     for (var i = 0; i < supertypes.length; i = (i + 1) | 0) {
@@ -41,16 +44,26 @@ function $rt_isAssignable(from, to) {
     }
     return false;
 }
+Array.prototype.fill = Array.prototype.fill || function(value,start,end) {
+    var len = this.length;
+    if (!len) return this;
+    start = start | 0;
+    var i = start < 0
+        ? Math.max(len + start, 0)
+        : Math.min(start, len);
+    end = end === undefined ? len : end | 0;
+    end = end < 0
+        ? Math.max(len + end, 0)
+        : Math.min(end, len);
+    for (; i < end; i++) {
+        this[i] = value;
+    }
+    return this;
+};
 function $rt_createArray(cls, sz) {
     var data = new Array(sz);
     var arr = new $rt_array(cls, data);
-    if (sz > 0) {
-        var i = 0;
-        do {
-            data[i] = null;
-            i = (i + 1) | 0;
-        } while (i < sz);
-    }
+    data.fill(null);
     return arr;
 }
 function $rt_wrapArray(cls, data) {
@@ -62,9 +75,7 @@ function $rt_createUnfilledArray(cls, sz) {
 function $rt_createLongArray(sz) {
     var data = new Array(sz);
     var arr = new $rt_array($rt_longcls(), data);
-    for (var i = 0; i < sz; i = (i + 1) | 0) {
-        data[i] = Long_ZERO;
-    }
+    data.fill(Long_ZERO);
     return arr;
 }
 function $rt_createNumericArray(cls, nativeArray) {
@@ -97,8 +108,18 @@ function $rt_arraycls(cls) {
     if (result === null) {
         var arraycls = {};
         var name = "[" + cls.$meta.binaryName;
-        arraycls.$meta = { item : cls, supertypes : [$rt_objcls()], primitive : false, superclass : $rt_objcls(),
-                name : name, binaryName : name, enum : false };
+        arraycls.$meta = {
+            item: cls,
+            supertypes: [$rt_objcls()],
+            primitive: false,
+            superclass: $rt_objcls(),
+            name: name,
+            binaryName: name,
+            enum: false,
+            simpleName: null,
+            declaringClass: null,
+            enclosingClass: null
+        };
         arraycls.classObject = null;
         arraycls.$array = null;
         result = arraycls;
@@ -110,7 +131,7 @@ function $rt_createcls() {
     return {
         $array : null,
         classObject : null,
-        $meta : {
+        $meta: {
             supertypes : [],
             superclass : null
         }
@@ -123,6 +144,9 @@ function $rt_createPrimitiveCls(name, binaryName) {
     cls.$meta.binaryName = binaryName;
     cls.$meta.enum = false;
     cls.$meta.item = null;
+    cls.$meta.simpleName = null;
+    cls.$meta.declaringClass = null;
+    cls.$meta.enclosingClass = null;
     return cls;
 }
 var $rt_booleanclsCache = null;
@@ -442,6 +466,20 @@ function $rt_metadata(data) {
 
         m.accessLevel = data[i++];
 
+        var innerClassInfo = data[i++];
+        if (innerClassInfo === 0) {
+            m.simpleName = null;
+            m.declaringClass = null;
+            m.enclosingClass = null;
+        } else {
+            var enclosingClass = innerClassInfo[0];
+            m.enclosingClass = enclosingClass !== 0 ? enclosingClass : null;
+            var declaringClass = innerClassInfo[1];
+            m.declaringClass = declaringClass !== 0 ? declaringClass : null;
+            var simpleName = innerClassInfo[2];
+            m.simpleName = simpleName !== 0 ? simpleName : null;
+        }
+
         var clinit = data[i++];
         cls.$clinit = clinit !== 0 ? clinit : function() {};
 
@@ -565,7 +603,6 @@ function $dbg_class(obj) {
     }
     return clsName;
 }
-
 function Long(lo, hi) {
     this.lo = lo | 0;
     this.hi = hi | 0;
@@ -595,7 +632,7 @@ Long.prototype.valueOf = function() {
 var Long_ZERO = new Long(0, 0);
 var Long_MAX_NORMAL = 1 << 18;
 function Long_fromInt(val) {
-    return val >= 0 ? new Long(val, 0) : new Long(val, -1);
+    return new Long(val, (-(val < 0)) | 0);
 }
 function Long_fromNumber(val) {
     if (val >= 0) {
@@ -605,14 +642,8 @@ function Long_fromNumber(val) {
     }
 }
 function Long_toNumber(val) {
-    var lo = val.lo;
-    var hi = val.hi;
-    if (lo < 0) {
-        lo += 0x100000000;
-    }
-    return 0x100000000 * hi + lo;
+    return 0x100000000 * val.hi + (val.lo >>> 0);
 }
-
 var $rt_imul = Math.imul || function(a, b) {
     var ah = (a >>> 16) & 0xFFFF;
     var al = a & 0xFFFF;
@@ -621,20 +652,26 @@ var $rt_imul = Math.imul || function(a, b) {
     return (al * bl + (((ah * bl + al * bh) << 16) >>> 0)) | 0;
 };
 var $rt_udiv = function(a, b) {
-    if (a < 0) {
-        a += 0x100000000;
-    }
-    if (b < 0) {
-        b += 0x100000000;
-    }
-    return (a / b) | 0;
+    return ((a >>> 0) / (b >>> 0)) >>> 0;
 };
 var $rt_umod = function(a, b) {
-    if (a < 0) {
-        a += 0x100000000;
-    }
-    if (b < 0) {
-        b += 0x100000000;
-    }
-    return (a % b) | 0;
+    return ((a >>> 0) % (b >>> 0)) >>> 0;
 };
+function $rt_checkBounds(index, array) {
+    if (index < 0 || index >= array.length) {
+        $rt_throwAIOOBE();
+    }
+    return index;
+}
+function $rt_checkUpperBound(index, array) {
+    if (index >= array.length) {
+        $rt_throwAIOOBE();
+    }
+    return index;
+}
+function $rt_checkLowerBound(index) {
+    if (index < 0) {
+        $rt_throwAIOOBE();
+    }
+    return index;
+}

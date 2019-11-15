@@ -36,6 +36,9 @@ class InstructionStringifier implements InstructionReader {
         Set<String> occupiedLabels = new HashSet<>();
         for (int i = 0; i < program.variableCount(); ++i) {
             VariableReader var = program.variableAt(i);
+            if (var == null) {
+                continue;
+            }
             String suggestedName = var.getLabel() != null ? var.getLabel() : Integer.toString(i);
             if (!occupiedLabels.add(suggestedName)) {
                 int suffix = 1;
@@ -155,6 +158,11 @@ class InstructionStringifier implements InstructionReader {
     }
 
     private InstructionStringifier escapeIdentifierIfNeeded(String s) {
+        escapeIdentifierIfNeeded(sb, s);
+        return this;
+    }
+
+    static void escapeIdentifierIfNeeded(StringBuilder sb, String s) {
         boolean needsEscaping = false;
         if (s.isEmpty()) {
             needsEscaping = true;
@@ -173,8 +181,6 @@ class InstructionStringifier implements InstructionReader {
         } else {
             sb.append(s);
         }
-
-        return this;
     }
 
     @Override
@@ -543,5 +549,16 @@ class InstructionStringifier implements InstructionReader {
     @Override
     public void monitorExit(VariableReader objectRef) {
         append("monitorExit ").appendLocalVar(objectRef);
+    }
+
+    @Override
+    public void boundCheck(VariableReader receiver, VariableReader index, VariableReader array, boolean lower) {
+        appendLocalVar(receiver).append(" = boundCheck ").appendLocalVar(index);
+        if (array != null) {
+            append(" upper ").appendLocalVar(array);
+        }
+        if (lower) {
+            append(" lower");
+        }
     }
 }

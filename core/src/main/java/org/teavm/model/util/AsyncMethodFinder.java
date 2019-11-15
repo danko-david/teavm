@@ -22,15 +22,10 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import org.teavm.backend.javascript.spi.InjectedBy;
 import org.teavm.callgraph.CallGraph;
 import org.teavm.callgraph.CallGraphNode;
 import org.teavm.callgraph.CallSite;
-import org.teavm.diagnostics.Diagnostics;
 import org.teavm.interop.Async;
-import org.teavm.interop.SuppressSyncErrors;
-import org.teavm.interop.Sync;
-import org.teavm.model.CallLocation;
 import org.teavm.model.ClassReader;
 import org.teavm.model.ElementModifier;
 import org.teavm.model.ListableClassReaderSource;
@@ -48,13 +43,11 @@ public class AsyncMethodFinder {
     private Set<MethodReference> readonlyAsyncMethods = Collections.unmodifiableSet(asyncMethods);
     private Set<MethodReference> readonlyAsyncFamilyMethods = Collections.unmodifiableSet(asyncFamilyMethods.keySet());
     private CallGraph callGraph;
-    private Diagnostics diagnostics;
     private ListableClassReaderSource classSource;
     private boolean hasAsyncMethods;
 
-    public AsyncMethodFinder(CallGraph callGraph, Diagnostics diagnostics) {
+    public AsyncMethodFinder(CallGraph callGraph) {
         this.callGraph = callGraph;
-        this.diagnostics = diagnostics;
     }
 
     public Set<MethodReference> getAsyncMethods() {
@@ -67,7 +60,7 @@ public class AsyncMethodFinder {
 
     public void find(ListableClassReaderSource classSource) {
         this.classSource = classSource;
-        hasAsyncMethods = hasAsyncMethods();
+        hasAsyncMethods = findAsyncMethods();
         for (String clsName : classSource.getClassNames()) {
             ClassReader cls = classSource.get(clsName);
             for (MethodReader method : cls.getMethods()) {
@@ -108,7 +101,7 @@ public class AsyncMethodFinder {
         }
     }
 
-    private boolean hasAsyncMethods() {
+    private boolean findAsyncMethods() {
         boolean result = false;
         loop: for (String clsName : classSource.getClassNames()) {
             ClassReader cls = classSource.get(clsName);
@@ -125,6 +118,10 @@ public class AsyncMethodFinder {
         ClassReader cls = classSource.get("java.lang.Thread");
         MethodReader method = cls != null ? cls.getMethod(new MethodDescriptor("start", void.class)) : null;
         return result && method != null;
+    }
+
+    public boolean hasAsyncMethods() {
+        return hasAsyncMethods;
     }
 
     private boolean hasMonitor(MethodReader method) {
@@ -161,20 +158,6 @@ public class AsyncMethodFinder {
         MethodReader method = cls.getMethod(methodRef.getDescriptor());
         if (method == null) {
             return;
-        }
-        if (method.getAnnotations().get(Sync.class.getName()) != null
-                || method.getAnnotations().get(InjectedBy.class.getName()) != null) {
-            if (method.getAnnotations().get(SuppressSyncErrors.class.getName()) == null) {
-                diagnostics.error(new CallLocation(methodRef), "Method {{m0}} is claimed to be "
-                        + "synchronous, but it is has invocations of asynchronous methods:" 
-                        + stack.toString(), methodRef);
-                return;
-            } else {
-                diagnostics.warning(new CallLocation(methodRef), "Error as Warning because "
-                        + " Method {{m0}} has @SuppressSyncErrors annotation. Method {{m0}} "
-                        + "is claimed to be synchronous, but it is has invocations of "
-                        + "asynchronous methods:" + stack.toString(), methodRef);
-            }
         }
 
         if (!hasAsyncMethods && methodRef.getClassName().equals("java.lang.Object")
@@ -288,7 +271,7 @@ public class AsyncMethodFinder {
         }
     }
 
-    class AsyncInstructionReader extends AbstractInstructionReader {
+    static class AsyncInstructionReader extends AbstractInstructionReader {
         boolean async;
 
         @Override

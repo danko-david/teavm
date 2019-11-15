@@ -15,10 +15,8 @@
  */
 package org.teavm.backend.c.intrinsic;
 
-import org.teavm.ast.ConstantExpr;
 import org.teavm.ast.Expr;
 import org.teavm.ast.InvocationExpr;
-import org.teavm.backend.c.generate.StringPoolGenerator;
 import org.teavm.interop.Strings;
 import org.teavm.model.MethodReference;
 
@@ -33,14 +31,9 @@ public class StringsIntrinsic implements Intrinsic {
         switch (invocation.getMethod().getName()) {
             case "toC": {
                 Expr arg = invocation.getArguments().get(0);
-                String literal = extractStringConstant(arg);
-                if (literal != null) {
-                    StringPoolGenerator.generateSimpleStringLiteral(context.writer(), literal);
-                } else {
-                    context.writer().print("teavm_stringToC(");
-                    context.emit(arg);
-                    context.writer().print(")");
-                }
+                context.writer().print("teavm_stringToC(");
+                context.emit(arg);
+                context.writer().print(")");
                 break;
             }
             case "fromC":
@@ -48,15 +41,18 @@ public class StringsIntrinsic implements Intrinsic {
                 context.emit(invocation.getArguments().get(0));
                 context.writer().print(")");
                 break;
+            case "toC16": {
+                Expr arg = invocation.getArguments().get(0);
+                context.writer().print("teavm_stringToC16(");
+                context.emit(arg);
+                context.writer().print(")");
+                break;
+            }
+            case "fromC16":
+                context.writer().print("teavm_c16ToString(");
+                context.emit(invocation.getArguments().get(0));
+                context.writer().print(")");
+                break;
         }
-    }
-
-    private String extractStringConstant(Expr expr) {
-        if (!(expr instanceof ConstantExpr)) {
-            return null;
-        }
-
-        Object value = ((ConstantExpr) expr).getValue();
-        return value instanceof String ? (String) value : null;
     }
 }

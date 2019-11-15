@@ -20,5 +20,5 @@ package org.teavm.model.lowlevel;
 
     ExceptionHandlerDescriptorAnnot[] handlers();
 
-    CallSiteLocationAnnot location();
+    CallSiteLocationsAnnot location();
 }

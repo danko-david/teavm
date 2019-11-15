@@ -24,6 +24,7 @@ import java.util.Map;
 import org.teavm.ast.ArrayType;
 import org.teavm.ast.AssignmentStatement;
 import org.teavm.ast.BinaryOperation;
+import org.teavm.ast.BoundCheckExpr;
 import org.teavm.ast.BreakStatement;
 import org.teavm.ast.ContinueStatement;
 import org.teavm.ast.Expr;
@@ -40,6 +41,7 @@ import org.teavm.ast.SwitchStatement;
 import org.teavm.ast.ThrowStatement;
 import org.teavm.ast.UnaryOperation;
 import org.teavm.ast.UnwrapArrayExpr;
+import org.teavm.ast.WhileStatement;
 import org.teavm.common.GraphIndexer;
 import org.teavm.model.BasicBlock;
 import org.teavm.model.ClassHolderSource;
@@ -53,6 +55,7 @@ import org.teavm.model.instructions.ArrayLengthInstruction;
 import org.teavm.model.instructions.AssignInstruction;
 import org.teavm.model.instructions.BinaryBranchingInstruction;
 import org.teavm.model.instructions.BinaryInstruction;
+import org.teavm.model.instructions.BoundCheckInstruction;
 import org.teavm.model.instructions.BranchingInstruction;
 import org.teavm.model.instructions.CastInstruction;
 import org.teavm.model.instructions.CastIntegerInstruction;
@@ -95,9 +98,7 @@ class StatementGenerator implements InstructionVisitor {
     private int lastSwitchId;
     final List<Statement> statements = new ArrayList<>();
     GraphIndexer indexer;
-    BasicBlock nextBlock;
-    BasicBlock currentBlock;
-    Decompiler.Block[] blockMap;
+    Decompiler.Block currentBlock;
     Program program;
     ClassHolderSource classSource;
     private TextLocation currentLocation;
@@ -341,10 +342,7 @@ class StatementGenerator implements InstructionVisitor {
                 conditions[i] = conditionList.get(i);
             }
             clause.setConditions(conditions);
-            Statement jumpStmt = generateJumpStatement(stmt, target);
-            if (jumpStmt != null) {
-                clause.getBody().add(jumpStmt);
-            }
+            clause.getBody().add(generateJumpStatement(stmt, target));
             stmt.getClauses().add(clause);
         }
         Statement breakStmt = generateJumpStatement(insn.getDefaultTarget());
@@ -496,6 +494,7 @@ class StatementGenerator implements InstructionVisitor {
         } else {
             stmt = Statement.assign(null, invocationExpr);
         }
+        invocationExpr.setLocation(currentLocation);
         stmt.setLocation(currentLocation);
         stmt.setAsync(async);
         async = false;
@@ -536,26 +535,32 @@ class StatementGenerator implements InstructionVisitor {
         throw new IllegalArgumentException(type.toString());
     }
 
-    Statement generateJumpStatement(BasicBlock target) {
-        if (nextBlock == target && blockMap[target.getIndex()] == null) {
+    Statement generateJumpStatement(Decompiler.Block sourceBlock, BasicBlock target) {
+        Decompiler.Block targetBlock = getTargetBlock(sourceBlock, target);
+        if (targetBlock == null) {
+            int targetIndex = indexer.indexOf(target.getIndex());
+            if (targetIndex >= sourceBlock.end) {
+                throw new IllegalStateException("Could not find block for basic block $" + target.getIndex());
+            }
             return null;
         }
-        Decompiler.Block block = blockMap[target.getIndex()];
-        if (block == null) {
-            throw new IllegalStateException("Could not find block for basic block $" + target.getIndex());
-        }
-        if (target.getIndex() == indexer.nodeAt(block.end)) {
+        if (target.getIndex() == indexer.nodeAt(targetBlock.end)) {
             BreakStatement breakStmt = new BreakStatement();
             breakStmt.setLocation(currentLocation);
-            breakStmt.setTarget(block.statement);
+            breakStmt.setTarget(targetBlock.statement);
             return breakStmt;
         } else {
             ContinueStatement contStmt = new ContinueStatement();
             contStmt.setLocation(currentLocation);
-            contStmt.setTarget(block.statement);
+            contStmt.setTarget(targetBlock.statement);
             return contStmt;
         }
     }
+
+    Statement generateJumpStatement(BasicBlock target) {
+        return generateJumpStatement(currentBlock, target);
+    }
+
     private Statement generateJumpStatement(SwitchStatement stmt, int target) {
         Statement body = generateJumpStatement(program.basicBlockAt(target));
         if (body == null) {
@@ -564,6 +569,22 @@ class StatementGenerator implements InstructionVisitor {
             body = breakStmt;
         }
         return body;
+    }
+
+    private Decompiler.Block getTargetBlock(Decompiler.Block source, BasicBlock target) {
+        Decompiler.Block block = source;
+        int targetIndex = indexer.indexOf(target.getIndex());
+        Decompiler.Block candidate = null;
+        while (block != null && (block.start >= targetIndex || block.end <= targetIndex)) {
+            if (block.statement instanceof WhileStatement && block.start == targetIndex) {
+                return block;
+            }
+            if (block.end == targetIndex) {
+                candidate = block;
+            }
+            block = block.parent;
+        }
+        return candidate;
     }
 
     private void branch(Expr condition, BasicBlock consequentBlock, BasicBlock alternativeBlock) {
@@ -609,5 +630,17 @@ class StatementGenerator implements InstructionVisitor {
         stmt.setLocation(currentLocation);
         stmt.setObjectRef(Expr.var(insn.getObjectRef().getIndex()));
         statements.add(stmt);
+    }
+
+    @Override
+    public void visit(BoundCheckInstruction insn) {
+        BoundCheckExpr expr = new BoundCheckExpr();
+        expr.setLower(insn.isLower());
+        expr.setIndex(Expr.var(insn.getIndex().getIndex()));
+        if (insn.getArray() != null) {
+            expr.setArray(Expr.var(insn.getArray().getIndex()));
+        }
+        expr.setLocation(insn.getLocation());
+        assign(expr, insn.getReceiver());
     }
 }

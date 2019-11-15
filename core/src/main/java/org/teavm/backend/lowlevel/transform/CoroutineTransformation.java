@@ -79,10 +79,13 @@ public class CoroutineTransformation {
     private SwitchInstruction resumeSwitch;
     private int parameterCount;
     private ValueType returnType;
+    private boolean hasThreads;
 
-    public CoroutineTransformation(ClassReaderSource classSource, Set<MethodReference> asyncMethods) {
+    public CoroutineTransformation(ClassReaderSource classSource, Set<MethodReference> asyncMethods,
+            boolean hasThreads) {
         this.classSource = classSource;
         this.asyncMethods = asyncMethods;
+        this.hasThreads = hasThreads;
     }
 
     public void apply(Program program, MethodReference methodReference) {
@@ -109,7 +112,7 @@ public class CoroutineTransformation {
         parameterCount = methodReference.parameterCount();
         returnType = methodReference.getReturnType();
         variableTypes.inferTypes(program, methodReference);
-        livenessAnalysis.analyze(program);
+        livenessAnalysis.analyze(program, methodReference.getDescriptor());
         splitter = new BasicBlockSplitter(program);
         int basicBlockCount = program.basicBlockCount();
         createSplitPrologue();
@@ -117,6 +120,7 @@ public class CoroutineTransformation {
             processBlock(program.basicBlockAt(i));
         }
         splitter.fixProgram();
+        new PhiUpdater().updatePhis(program, methodReference.parameterCount() + 1);
         processIrreducibleCfg();
     }
 
@@ -232,7 +236,7 @@ public class CoroutineTransformation {
         } else if (instruction instanceof InitClassInstruction) {
             return isSplittingClassInitializer(((InitClassInstruction) instruction).getClassName());
         } else {
-            return instruction instanceof MonitorEnterInstruction;
+            return hasThreads && instruction instanceof MonitorEnterInstruction;
         }
     }
 

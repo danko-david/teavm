@@ -72,7 +72,13 @@ public interface BuildStrategy {
 
     void setWasmVersion(WasmBinaryVersion wasmVersion);
 
-    void setHeapSize(int heapSize);
+    void setMinHeapSize(int minHeapSize);
+
+    void setMaxHeapSize(int maxHeapSize);
+
+    void setLongjmpSupported(boolean value);
+
+    void setHeapDump(boolean heapDump);
 
     BuildResult build() throws BuildException;
 }

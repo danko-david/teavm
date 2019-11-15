@@ -151,7 +151,7 @@ public class CodeServlet extends HttpServlet {
 
     public CodeServlet(String mainClass, String[] classPath) {
         this.mainClass = mainClass;
-        this.classPath = classPath.clone();
+        this.classPath = classPath != null ? classPath.clone() : new String[0];
 
         httpClient = new HttpClient();
         httpClient.setFollowRedirects(false);
@@ -770,7 +770,8 @@ public class CodeServlet extends HttpServlet {
         jsTarget.setMinifying(false);
         jsTarget.setAstCache(astCache);
         jsTarget.setDebugEmitter(debugInformationBuilder);
-        jsTarget.setTopLevelNameLimit(500);
+        jsTarget.setTopLevelNameLimit(2000);
+        jsTarget.setStrict(true);
         vm.setOptimizationLevel(TeaVMOptimizationLevel.SIMPLE);
         vm.setCacheStatus(classSource);
         vm.addVirtualMethods(m -> true);
@@ -907,6 +908,7 @@ public class CodeServlet extends HttpServlet {
 
     private List<String> getChangedClasses(Collection<File> changedFiles) {
         List<String> result = new ArrayList<>();
+        String[] prefixes = Arrays.stream(classPath).map(s -> s.replace('\\', '/')).toArray(String[]::new);
 
         for (File file : changedFiles) {
             String path = file.getPath().replace('\\', '/');
@@ -914,7 +916,7 @@ public class CodeServlet extends HttpServlet {
                 continue;
             }
 
-            String prefix = Arrays.stream(classPath)
+            String prefix = Arrays.stream(prefixes)
                     .filter(path::startsWith)
                     .findFirst()
                     .orElse("");

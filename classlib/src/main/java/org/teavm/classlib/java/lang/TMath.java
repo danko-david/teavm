@@ -16,6 +16,7 @@
 package org.teavm.classlib.java.lang;
 
 import org.teavm.backend.javascript.spi.GeneratedBy;
+import org.teavm.classlib.PlatformDetector;
 import org.teavm.interop.Import;
 import org.teavm.interop.NoSideEffects;
 import org.teavm.interop.Unmanaged;
@@ -126,10 +127,17 @@ public final class TMath extends TObject {
         return (long) (a + signum(a) * 0.5);
     }
 
+    @Unmanaged
+    public static double random() {
+        return PlatformDetector.isC() ? randomC() : randomImpl();
+    }
+
+    @Import(name = "teavm_rand")
+    private static native double randomC();
+
     @GeneratedBy(MathNativeGenerator.class)
     @Import(module = "teavmMath", name = "random")
-    @Unmanaged
-    public static native double random();
+    private static native double randomImpl();
 
     public static int min(int a, int b) {
         return a < b ? a : b;
@@ -211,7 +219,7 @@ public final class TMath extends TObject {
     }
 
     public static double hypot(double x, double y) {
-        return x * x + y * y;
+        return sqrt(x * x + y * y);
     }
 
     public static double expm1(double x) {

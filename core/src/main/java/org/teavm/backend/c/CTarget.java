@@ -15,18 +15,19 @@
  */
 package org.teavm.backend.c;
 
-import com.carrotsearch.hppc.ObjectByteHashMap;
-import com.carrotsearch.hppc.ObjectByteMap;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
-import java.util.ArrayDeque;
+import java.io.OutputStream;
+import java.io.OutputStreamWriter;
+import java.io.Writer;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
-import java.util.Deque;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
@@ -36,13 +37,12 @@ import org.teavm.backend.c.analyze.CDependencyListener;
 import org.teavm.backend.c.analyze.InteropDependencyListener;
 import org.teavm.backend.c.generate.BufferedCodeWriter;
 import org.teavm.backend.c.generate.CallSiteGenerator;
+import org.teavm.backend.c.generate.ClassGenerationContext;
 import org.teavm.backend.c.generate.ClassGenerator;
 import org.teavm.backend.c.generate.CodeGenerationVisitor;
-import org.teavm.backend.c.generate.CodeGeneratorUtil;
 import org.teavm.backend.c.generate.CodeWriter;
 import org.teavm.backend.c.generate.GenerationContext;
 import org.teavm.backend.c.generate.IncludeManager;
-import org.teavm.backend.c.generate.NameProvider;
 import org.teavm.backend.c.generate.OutputFileUtil;
 import org.teavm.backend.c.generate.SimpleIncludeManager;
 import org.teavm.backend.c.generate.SimpleStringPool;
@@ -63,6 +63,7 @@ import org.teavm.backend.c.intrinsic.Intrinsic;
 import org.teavm.backend.c.intrinsic.IntrinsicContext;
 import org.teavm.backend.c.intrinsic.IntrinsicFactory;
 import org.teavm.backend.c.intrinsic.LongIntrinsic;
+import org.teavm.backend.c.intrinsic.MemoryTraceIntrinsic;
 import org.teavm.backend.c.intrinsic.MutatorIntrinsic;
 import org.teavm.backend.c.intrinsic.PlatformClassIntrinsic;
 import org.teavm.backend.c.intrinsic.PlatformClassMetadataIntrinsic;
@@ -72,18 +73,21 @@ import org.teavm.backend.c.intrinsic.RuntimeClassIntrinsic;
 import org.teavm.backend.c.intrinsic.ShadowStackIntrinsic;
 import org.teavm.backend.c.intrinsic.StringsIntrinsic;
 import org.teavm.backend.c.intrinsic.StructureIntrinsic;
+import org.teavm.backend.lowlevel.analyze.LowLevelInliningFilterFactory;
 import org.teavm.backend.lowlevel.dependency.ExceptionHandlingDependencyListener;
 import org.teavm.backend.lowlevel.dependency.WeakReferenceDependencyListener;
+import org.teavm.backend.lowlevel.generate.NameProvider;
+import org.teavm.backend.lowlevel.generate.NameProviderWithSpecialNames;
 import org.teavm.backend.lowlevel.transform.CoroutineTransformation;
 import org.teavm.backend.lowlevel.transform.WeakReferenceTransformation;
 import org.teavm.cache.EmptyMethodNodeCache;
 import org.teavm.cache.MethodNodeCache;
+import org.teavm.common.JsonUtil;
 import org.teavm.dependency.ClassDependency;
 import org.teavm.dependency.DependencyAnalyzer;
 import org.teavm.dependency.DependencyListener;
 import org.teavm.interop.Address;
 import org.teavm.interop.Platforms;
-import org.teavm.interop.Structure;
 import org.teavm.model.BasicBlock;
 import org.teavm.model.ClassHierarchy;
 import org.teavm.model.ClassHolder;
@@ -108,13 +112,16 @@ import org.teavm.model.instructions.InvocationType;
 import org.teavm.model.instructions.InvokeInstruction;
 import org.teavm.model.lowlevel.CallSiteDescriptor;
 import org.teavm.model.lowlevel.Characteristics;
+import org.teavm.model.lowlevel.CheckInstructionTransformation;
 import org.teavm.model.lowlevel.ClassInitializerEliminator;
 import org.teavm.model.lowlevel.ClassInitializerTransformer;
 import org.teavm.model.lowlevel.ExportDependencyListener;
-import org.teavm.model.lowlevel.NullCheckInsertion;
-import org.teavm.model.lowlevel.NullCheckTransformation;
+import org.teavm.model.lowlevel.LowLevelNullCheckFilter;
 import org.teavm.model.lowlevel.ShadowStackTransformer;
+import org.teavm.model.optimization.InliningFilterFactory;
+import org.teavm.model.transformation.BoundCheckInsertion;
 import org.teavm.model.transformation.ClassPatch;
+import org.teavm.model.transformation.NullCheckInsertion;
 import org.teavm.model.util.AsyncMethodFinder;
 import org.teavm.runtime.Allocator;
 import org.teavm.runtime.CallSite;
@@ -122,6 +129,7 @@ import org.teavm.runtime.CallSiteLocation;
 import org.teavm.runtime.EventQueue;
 import org.teavm.runtime.ExceptionHandling;
 import org.teavm.runtime.Fiber;
+import org.teavm.runtime.GC;
 import org.teavm.runtime.RuntimeArray;
 import org.teavm.runtime.RuntimeClass;
 import org.teavm.runtime.RuntimeObject;
@@ -135,28 +143,48 @@ public class CTarget implements TeaVMTarget, TeaVMCHost {
     private static final Set<MethodReference> VIRTUAL_METHODS = new HashSet<>(Arrays.asList(
             new MethodReference(Object.class, "clone", Object.class)
     ));
-    private static final MethodReference STRING_CONSTRUCTOR = new MethodReference(String.class,
-            "<init>", char[].class, void.class);
+    private static final String[] RUNTIME_FILES = { "core.c", "core.h", "date.c", "date.h", "definitions.h",
+            "exceptions.h", "fiber.c", "fiber.h", "file.c", "file.h", "heapdump.c", "heapdump.h", "heaptrace.c",
+            "heaptrace.h", "log.c", "log.h", "memory.c", "memory.h", "references.c", "references.h",
+            "resource.c", "resource.h", "runtime.h", "stack.c", "stack.h", "string.c", "string.h",
+            "stringhash.c", "stringhash.h", "time.c", "time.h", "virtcall.c", "virtcall.h"
+    };
 
     private TeaVMTargetController controller;
+    private NameProvider rawNameProvider;
     private ClassInitializerEliminator classInitializerEliminator;
     private ClassInitializerTransformer classInitializerTransformer;
     private ShadowStackTransformer shadowStackTransformer;
     private NullCheckInsertion nullCheckInsertion;
-    private NullCheckTransformation nullCheckTransformation;
+    private BoundCheckInsertion boundCheckInsertion = new BoundCheckInsertion();
+    private CheckInstructionTransformation checkTransformation;
     private ExportDependencyListener exportDependencyListener = new ExportDependencyListener();
-    private int minHeapSize = 32 * 1024 * 1024;
+    private int minHeapSize = 4 * 1024 * 1024;
+    private int maxHeapSize = 128 * 1024 * 1024;
     private List<IntrinsicFactory> intrinsicFactories = new ArrayList<>();
     private List<GeneratorFactory> generatorFactories = new ArrayList<>();
     private Characteristics characteristics;
     private Set<MethodReference> asyncMethods;
+    private boolean hasThreads;
     private MethodNodeCache astCache = EmptyMethodNodeCache.INSTANCE;
     private boolean incremental;
     private boolean lineNumbersGenerated;
     private SimpleStringPool stringPool;
+    private boolean longjmpUsed = true;
+    private boolean heapDump;
+    private boolean obfuscated;
+    private List<CallSiteDescriptor> callSites = new ArrayList<>();
+
+    public CTarget(NameProvider nameProvider) {
+        rawNameProvider = nameProvider;
+    }
 
     public void setMinHeapSize(int minHeapSize) {
         this.minHeapSize = minHeapSize;
+    }
+
+    public void setMaxHeapSize(int maxHeapSize) {
+        this.maxHeapSize = maxHeapSize;
     }
 
     public void setIncremental(boolean incremental) {
@@ -167,8 +195,20 @@ public class CTarget implements TeaVMTarget, TeaVMCHost {
         this.lineNumbersGenerated = lineNumbersGenerated;
     }
 
+    public void setLongjmpUsed(boolean longjmpUsed) {
+        this.longjmpUsed = longjmpUsed;
+    }
+
+    public void setHeapDump(boolean heapDump) {
+        this.heapDump = heapDump;
+    }
+
     public void setAstCache(MethodNodeCache astCache) {
         this.astCache = astCache;
+    }
+
+    public void setObfuscated(boolean obfuscated) {
+        this.obfuscated = obfuscated;
     }
 
     @Override
@@ -192,9 +232,9 @@ public class CTarget implements TeaVMTarget, TeaVMCHost {
         characteristics = new Characteristics(controller.getUnprocessedClassSource());
         classInitializerEliminator = new ClassInitializerEliminator(controller.getUnprocessedClassSource());
         classInitializerTransformer = new ClassInitializerTransformer();
-        shadowStackTransformer = new ShadowStackTransformer(characteristics);
-        nullCheckInsertion = new NullCheckInsertion(characteristics);
-        nullCheckTransformation = new NullCheckTransformation();
+        shadowStackTransformer = new ShadowStackTransformer(characteristics, !longjmpUsed);
+        nullCheckInsertion = new NullCheckInsertion(new LowLevelNullCheckFilter(characteristics));
+        checkTransformation = new CheckInstructionTransformation();
 
         controller.addVirtualMethods(VIRTUAL_METHODS::contains);
     }
@@ -229,6 +269,9 @@ public class CTarget implements TeaVMTarget, TeaVMCHost {
                 RuntimeClass.class, Address.class, int.class, RuntimeArray.class)).use();
 
         dependencyAnalyzer.linkMethod(new MethodReference(Allocator.class, "<clinit>", void.class)).use();
+        dependencyAnalyzer.linkMethod(new MethodReference(GC.class, "fixHeap", void.class)).use();
+        dependencyAnalyzer.linkMethod(new MethodReference(GC.class, "tryShrink", void.class)).use();
+        dependencyAnalyzer.linkMethod(new MethodReference(GC.class, "collectGarbage", void.class)).use();
 
         dependencyAnalyzer.linkMethod(new MethodReference(ExceptionHandling.class, "throwException",
                 Throwable.class, void.class)).use();
@@ -236,6 +279,8 @@ public class CTarget implements TeaVMTarget, TeaVMCHost {
                 void.class)).use();
         dependencyAnalyzer.linkMethod(new MethodReference(ExceptionHandling.class, "throwNullPointerException",
                 void.class)).use();
+        dependencyAnalyzer.linkMethod(new MethodReference(ExceptionHandling.class,
+                "throwArrayIndexOutOfBoundsException", void.class)).use();
         dependencyAnalyzer.linkMethod(new MethodReference(NullPointerException.class, "<init>", void.class))
                 .propagate(0, NullPointerException.class.getName())
                 .use();
@@ -246,10 +291,6 @@ public class CTarget implements TeaVMTarget, TeaVMCHost {
         dependencyAnalyzer.linkClass("java.lang.String");
         dependencyAnalyzer.linkClass("java.lang.Class");
         dependencyAnalyzer.linkField(new FieldReference("java.lang.String", "hashCode"));
-        dependencyAnalyzer.linkMethod(STRING_CONSTRUCTOR)
-                .propagate(0, "java.lang.String")
-                .propagate(1, "[C")
-                .use();
 
         ClassDependency runtimeClassDep = dependencyAnalyzer.linkClass(RuntimeClass.class.getName());
         ClassDependency runtimeObjectDep = dependencyAnalyzer.linkClass(RuntimeObject.class.getName());
@@ -283,41 +324,45 @@ public class CTarget implements TeaVMTarget, TeaVMCHost {
 
     @Override
     public void analyzeBeforeOptimizations(ListableClassReaderSource classSource) {
-        AsyncMethodFinder asyncFinder = new AsyncMethodFinder(controller.getDependencyInfo().getCallGraph(),
-                controller.getDiagnostics());
+        AsyncMethodFinder asyncFinder = new AsyncMethodFinder(controller.getDependencyInfo().getCallGraph());
         asyncFinder.find(classSource);
         asyncMethods = new HashSet<>(asyncFinder.getAsyncMethods());
         asyncMethods.addAll(asyncFinder.getAsyncFamilyMethods());
+        hasThreads = asyncFinder.hasAsyncMethods();
     }
 
     @Override
     public void beforeOptimizations(Program program, MethodReader method) {
         nullCheckInsertion.transformProgram(program, method.getReference());
+        boundCheckInsertion.transformProgram(program, method.getReference());
     }
 
     @Override
     public void afterOptimizations(Program program, MethodReader method) {
         classInitializerEliminator.apply(program);
         classInitializerTransformer.transform(program);
-        nullCheckTransformation.apply(program, method.getResultType());
-        new CoroutineTransformation(controller.getUnprocessedClassSource(), asyncMethods)
+        if (!longjmpUsed) {
+            checkTransformation.apply(program, method.getResultType());
+        }
+        new CoroutineTransformation(controller.getUnprocessedClassSource(), asyncMethods, hasThreads)
                 .apply(program, method.getReference());
         ShadowStackTransformer shadowStackTransformer = !incremental
                 ? this.shadowStackTransformer
-                : new ShadowStackTransformer(characteristics);
+                : new ShadowStackTransformer(characteristics, !longjmpUsed);
         shadowStackTransformer.apply(program, method);
     }
 
     @Override
     public void emit(ListableClassHolderSource classes, BuildTarget buildTarget, String outputName) throws IOException {
-        VirtualTableProvider vtableProvider = createVirtualTableProvider(classes);
+        VirtualTableProvider vtableProvider = !incremental ? createVirtualTableProvider(classes) : null;
         ClassHierarchy hierarchy = new ClassHierarchy(classes);
-        TagRegistry tagRegistry = new TagRegistry(classes, hierarchy);
+        TagRegistry tagRegistry = !incremental ? new TagRegistry(classes, hierarchy) : null;
 
-        Decompiler decompiler = new Decompiler(classes, new HashSet<>(), false, true);
+        Decompiler decompiler = new Decompiler(classes, new HashSet<>(), controller.isFriendlyToDebugger());
         Characteristics characteristics = new Characteristics(controller.getUnprocessedClassSource());
 
-        NameProvider nameProvider = new NameProvider(controller.getUnprocessedClassSource());
+        NameProvider nameProvider = new NameProviderWithSpecialNames(rawNameProvider,
+                controller.getUnprocessedClassSource());
 
         List<Intrinsic> intrinsics = new ArrayList<>();
         intrinsics.add(new ShadowStackIntrinsic());
@@ -329,6 +374,7 @@ public class CTarget implements TeaVMTarget, TeaVMCHost {
         intrinsics.add(new PlatformClassIntrinsic());
         intrinsics.add(new PlatformClassMetadataIntrinsic());
         intrinsics.add(new GCIntrinsic());
+        intrinsics.add(new MemoryTraceIntrinsic());
         intrinsics.add(new MutatorIntrinsic());
         intrinsics.add(new ExceptionHandlingIntrinsic());
         intrinsics.add(new FunctionIntrinsic(characteristics, exportDependencyListener.getResolvedMethods()));
@@ -345,23 +391,39 @@ public class CTarget implements TeaVMTarget, TeaVMCHost {
         generators.add(new ReferenceQueueGenerator());
 
         stringPool = new SimpleStringPool();
+        boolean vmAssertions = Boolean.parseBoolean(System.getProperty("teavm.c.vmAssertions", "false"));
         GenerationContext context = new GenerationContext(vtableProvider, characteristics,
                 controller.getDependencyInfo(), stringPool, nameProvider, controller.getDiagnostics(), classes,
-                intrinsics, generators, asyncMethods::contains, buildTarget, incremental);
+                intrinsics, generators, asyncMethods::contains, buildTarget,
+                controller.getClassInitializerInfo(), incremental, longjmpUsed,
+                vmAssertions, vmAssertions || heapDump, obfuscated);
 
-        BufferedCodeWriter runtimeWriter = new BufferedCodeWriter(false);
-        BufferedCodeWriter runtimeHeaderWriter = new BufferedCodeWriter(false);
-        emitResource(runtimeWriter, "runtime.c");
+        BufferedCodeWriter specialWriter = new BufferedCodeWriter(false);
+        BufferedCodeWriter configHeaderWriter = new BufferedCodeWriter(false);
 
-        runtimeHeaderWriter.println("#pragma once");
+        configHeaderWriter.println("#pragma once");
         if (incremental) {
-            runtimeHeaderWriter.println("#define TEAVM_INCREMENTAL true");
+            configHeaderWriter.println("#define TEAVM_INCREMENTAL 1");
         }
-        emitResource(runtimeHeaderWriter, "runtime.h");
+        if (!longjmpUsed) {
+            configHeaderWriter.println("#define TEAVM_USE_SETJMP 0");
+        }
+        if (vmAssertions) {
+            configHeaderWriter.println("#define TEAVM_MEMORY_TRACE 1");
+        }
+        if (heapDump) {
+            configHeaderWriter.println("#define TEAVM_HEAP_DUMP 1");
+        }
+        if (obfuscated) {
+            configHeaderWriter.println("#define TEAVM_OBFUSCATED 1");
+        }
 
         ClassGenerator classGenerator = new ClassGenerator(context, tagRegistry, decompiler,
                 controller.getCacheStatus());
         classGenerator.setAstCache(astCache);
+        if (context.isLongjmp() && !context.isIncremental()) {
+            classGenerator.setCallSites(callSites);
+        }
         IntrinsicFactoryContextImpl intrinsicFactoryContext = new IntrinsicFactoryContextImpl(
                 controller.getUnprocessedClassSource(), controller.getClassLoader(), controller.getServices(),
                 controller.getProperties());
@@ -373,13 +435,13 @@ public class CTarget implements TeaVMTarget, TeaVMCHost {
         }
 
         generateClasses(classes, classGenerator, buildTarget);
-        generateSpecialFunctions(context, runtimeWriter);
-        OutputFileUtil.write(runtimeWriter, "runtime.c", buildTarget);
-        OutputFileUtil.write(runtimeHeaderWriter, "runtime.h", buildTarget);
-        copyResource("stringhash.c", buildTarget);
-        copyResource("references.c", buildTarget);
-        copyResource("date.c", buildTarget);
-        copyResource("file.c", buildTarget);
+
+        generateSpecialFunctions(context, specialWriter);
+        OutputFileUtil.write(configHeaderWriter, "config.h", buildTarget);
+        OutputFileUtil.write(specialWriter, "special.c", buildTarget);
+        for (String runtimeFile : RUNTIME_FILES) {
+            copyResource(runtimeFile, buildTarget);
+        }
         generateCallSites(buildTarget, context, classes.getClassNames());
         generateStrings(buildTarget, context);
 
@@ -414,11 +476,9 @@ public class CTarget implements TeaVMTarget, TeaVMCHost {
 
     private void generateClasses(ListableClassHolderSource classes, ClassGenerator classGenerator,
             BuildTarget buildTarget) throws IOException {
-        List<String> classNames = sortClassNames(classes);
-
         classGenerator.prepare(classes);
 
-        for (String className : classNames) {
+        for (String className : classes.getClassNames()) {
             BufferedCodeWriter writer = new BufferedCodeWriter(lineNumbersGenerated);
             BufferedCodeWriter headerWriter = new BufferedCodeWriter(false);
             ClassHolder cls = classes.get(className);
@@ -449,77 +509,81 @@ public class CTarget implements TeaVMTarget, TeaVMCHost {
         }
     }
 
-    private List<String> sortClassNames(ListableClassReaderSource classes) {
-        List<String> classNames = new ArrayList<>(classes.getClassNames().size());
-        Deque<String> stack = new ArrayDeque<>(classes.getClassNames());
-        ObjectByteMap<String> stateMap = new ObjectByteHashMap<>();
-
-        while (!stack.isEmpty()) {
-            String className = stack.pop();
-            byte state = stateMap.getOrDefault(className, (byte) 0);
-            switch (state) {
-                case 0: {
-                    stateMap.put(className, (byte) 1);
-                    stack.push(className);
-                    ClassReader cls = classes.get(className);
-                    String parent = cls != null ? cls.getParent() : null;
-                    if (parent == null) {
-                        parent = RuntimeObject.class.getName();
-                    }
-                    if (!parent.equals(Structure.class.getName()) && stateMap.getOrDefault(parent, (byte) 0) == 0) {
-                        stack.push(parent);
-                    }
-                    break;
-                }
-                case 1:
-                    stateMap.put(className, (byte) 2);
-                    classNames.add(className);
-                    break;
-            }
-        }
-
-        return classNames;
-    }
-
     private void generateCallSites(BuildTarget buildTarget, GenerationContext context,
             Collection<? extends String> classNames) throws IOException {
         BufferedCodeWriter writer = new BufferedCodeWriter(false);
-        BufferedCodeWriter headerWriter = new BufferedCodeWriter(false);
 
         IncludeManager includes = new SimpleIncludeManager(writer);
         includes.init("callsites.c");
-        includes.includePath("callsites.h");
 
-        headerWriter.println("#pragma once");
-        IncludeManager headerIncludes = new SimpleIncludeManager(headerWriter);
-        headerIncludes.init("callsites.h");
-        headerIncludes.includePath("runtime.h");
-        headerIncludes.includeClass(CallSiteGenerator.CALL_SITE);
-
-        if (incremental) {
-            generateIncrementalCallSites(context, headerWriter);
-        } else {
-            generateFastCallSites(context, writer, includes, headerWriter, classNames);
+        if (!incremental) {
+            generateFastCallSites(context, writer, includes, classNames);
         }
 
         OutputFileUtil.write(writer, "callsites.c", buildTarget);
-        OutputFileUtil.write(headerWriter, "callsites.h", buildTarget);
     }
 
     private void generateFastCallSites(GenerationContext context, CodeWriter writer, IncludeManager includes,
-            CodeWriter headerWriter, Collection<? extends String> classNames) {
-        String callSiteName = context.getNames().forClass(CallSiteGenerator.CALL_SITE);
-        headerWriter.println("extern " + callSiteName + " teavm_callSites[];");
-        headerWriter.println("#define TEAVM_FIND_CALLSITE(id, frame) (teavm_callSites + id)");
-
-        new CallSiteGenerator(context, writer, includes, "teavm_callSites")
-                .generate(CallSiteDescriptor.extract(context.getClassSource(), classNames));
+            Collection<? extends String> classNames) {
+        List<? extends CallSiteDescriptor> callSites = context.isLongjmp()
+                ? this.callSites
+                : CallSiteDescriptor.extract(context.getClassSource(), classNames);
+        new CallSiteGenerator(context, writer, includes, "teavm_callSites").generate(callSites);
+        if (obfuscated) {
+            generateCallSitesJson(context.getBuildTarget(), callSites);
+        }
     }
 
-    private void generateIncrementalCallSites(GenerationContext context, CodeWriter headerWriter) {
-        String callSiteName = context.getNames().forClass(CallSiteGenerator.CALL_SITE);
-        headerWriter.println("#define TEAVM_FIND_CALLSITE(id, frame) (((" + callSiteName
-                + "*) ((void**) frame)[3]) + id)");
+    private void generateCallSitesJson(BuildTarget buildTarget, List<? extends CallSiteDescriptor> callSites) {
+        try (OutputStream output = buildTarget.createResource("callsites.json");
+                Writer writer = new OutputStreamWriter(output, StandardCharsets.UTF_8)) {
+            writer.append("[\n");
+            boolean first = true;
+            for (CallSiteDescriptor descriptor : callSites) {
+                if (!first) {
+                    writer.append(",\n");
+                }
+                first = false;
+                writer.append("{\"id\":").append(Integer.toString(descriptor.getId()));
+                writer.append(",\"locations\":[");
+                org.teavm.model.lowlevel.CallSiteLocation[] locations = descriptor.getLocations();
+                if (locations != null) {
+                    boolean firstLocation = true;
+                    for (org.teavm.model.lowlevel.CallSiteLocation location : locations) {
+                        if (!firstLocation) {
+                            writer.append(",");
+                        }
+                        firstLocation = false;
+                        writer.append("{\"class\":");
+                        appendJsonString(writer, location.getClassName());
+                        writer.append(",\"method\":");
+                        appendJsonString(writer, location.getMethodName());
+                        writer.append(",\"file\":");
+                        appendJsonString(writer, location.getFileName());
+                        writer.append(",\"line\":").append(Integer.toString(location.getLineNumber()));
+                        writer.append("}");
+                    }
+                }
+                writer.append("]}");
+            }
+            if (!first) {
+                writer.append("\n");
+            }
+            writer.append("]");
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private static void appendJsonString(Writer writer, String string) throws IOException {
+        if (string == null) {
+            writer.append("null");
+            return;
+        }
+
+        writer.append("\"");
+        JsonUtil.writeEscapedString(writer, string);
+        writer.append("\"");
     }
 
     private void generateStrings(BuildTarget buildTarget, GenerationContext context) throws IOException {
@@ -535,7 +599,8 @@ public class CTarget implements TeaVMTarget, TeaVMCHost {
             headerWriter.println("extern TeaVM_String* teavm_stringPool[];");
             headerWriter.println("#define TEAVM_GET_STRING(i) teavm_stringPool[i]");
 
-            writer.println("#include \"strings.h\"");
+            includes.includePath("strings.h");
+            includes.includePath("stringhash.h");
             StringPoolGenerator poolGenerator = new StringPoolGenerator(context, "teavm_stringPool");
             poolGenerator.generate(writer);
             writer.println("void teavm_initStringPool() {").indent();
@@ -587,52 +652,65 @@ public class CTarget implements TeaVMTarget, TeaVMCHost {
 
     private void generateSpecialFunctions(GenerationContext context, CodeWriter writer) {
         IncludeManager includes = new SimpleIncludeManager(writer);
-        includes.init("runtime.c");
-        generateThrowCCE(context, writer, includes);
-        generateAllocateStringArray(context, writer, includes);
-        generateAllocateCharArray(context, writer, includes);
-        generateCreateString(context, writer, includes);
+        includes.init("special.c");
+        includes.includePath("core.h");
+        includes.includePath("string.h");
+        ClassGenerationContext classContext = new ClassGenerationContext(context, includes,
+                writer.fragment(), null, null);
+        generateThrowCCE(classContext, writer);
+        generateAllocateStringArray(classContext, writer, includes);
+        generateAllocateCharArray(classContext, writer, includes);
+        generateCreateString(classContext, writer, includes);
     }
 
-    private void generateThrowCCE(GenerationContext context, CodeWriter writer, IncludeManager includes) {
-        includes.includeClass(ExceptionHandling.class.getName());
+    private void generateThrowCCE(ClassGenerationContext classContext, CodeWriter writer) {
+        MethodReference methodRef = new MethodReference(ExceptionHandling.class,
+                "throwClassCastException", void.class);
+        classContext.importMethod(methodRef, true);
         writer.println("void* teavm_throwClassCastException() {").indent();
-        String methodName = context.getNames().forMethod(new MethodReference(ExceptionHandling.class,
-                "throwClassCastException", void.class));
+        String methodName = classContext.getContext().getNames().forMethod(methodRef);
         writer.println(methodName + "();");
         writer.println("return NULL;");
         writer.outdent().println("}");
     }
 
-    private void generateAllocateStringArray(GenerationContext context, CodeWriter writer, IncludeManager includes) {
-        includes.includeClass(Allocator.class.getName());
+    private void generateAllocateStringArray(ClassGenerationContext context, CodeWriter writer,
+            IncludeManager includes) {
+        NameProvider names = context.getContext().getNames();
+        MethodReference allocMethod = new MethodReference(Allocator.class,
+                "allocateArray", RuntimeClass.class, int.class, Address.class);
+        context.importMethod(allocMethod, true);
         includes.includeType(ValueType.parse(String[].class));
         writer.println("TeaVM_Array* teavm_allocateStringArray(int32_t size) {").indent();
-        String allocateArrayName = context.getNames().forMethod(new MethodReference(Allocator.class,
-                        "allocateArray", RuntimeClass.class, int.class, Address.class));
-        String stringClassName = context.getNames().forClassInstance(ValueType.arrayOf(
+        String allocateArrayName = names.forMethod(allocMethod);
+        String stringClassName = names.forClassInstance(ValueType.arrayOf(
                 ValueType.object(String.class.getName())));
         writer.println("return (TeaVM_Array*) " + allocateArrayName + "(&" + stringClassName + ", size);");
         writer.outdent().println("}");
     }
 
-    private void generateAllocateCharArray(GenerationContext context, CodeWriter writer, IncludeManager includes) {
+    private void generateAllocateCharArray(ClassGenerationContext context, CodeWriter writer,
+            IncludeManager includes) {
+        NameProvider names = context.getContext().getNames();
+        MethodReference allocMethod = new MethodReference(Allocator.class,
+                "allocateArray", RuntimeClass.class, int.class, Address.class);
+        context.importMethod(allocMethod, true);
         includes.includeType(ValueType.parse(char[].class));
         writer.println("TeaVM_Array* teavm_allocateCharArray(int32_t size) {").indent();
-        String allocateArrayName = context.getNames().forMethod(new MethodReference(Allocator.class,
-                "allocateArray", RuntimeClass.class, int.class, Address.class));
-        String charClassName = context.getNames().forClassInstance(ValueType.arrayOf(ValueType.CHARACTER));
+        String allocateArrayName = names.forMethod(allocMethod);
+        String charClassName = names.forClassInstance(ValueType.arrayOf(ValueType.CHARACTER));
         writer.println("return (TeaVM_Array*) " + allocateArrayName + "(&" + charClassName + ", size);");
         writer.outdent().println("}");
     }
 
-    private void generateCreateString(GenerationContext context, CodeWriter writer, IncludeManager includes) {
-        NameProvider names = context.getNames();
+    private void generateCreateString(ClassGenerationContext context, CodeWriter writer, IncludeManager includes) {
+        NameProvider names = context.getContext().getNames();
+        context.importMethod(CodeGenerationVisitor.ALLOC_METHOD, true);
         includes.includeClass(String.class.getName());
         writer.println("TeaVM_String* teavm_createString(TeaVM_Array* array) {").indent();
         writer.print("TeaVM_String* str = (TeaVM_String*) ").print(names.forMethod(CodeGenerationVisitor.ALLOC_METHOD))
                 .print("(&").print(names.forClassInstance(ValueType.object("java.lang.String"))).println(");");
-        writer.print(names.forMethod(STRING_CONSTRUCTOR)).println("(str, array);");
+        writer.print("str->characters = array;");
         writer.println("return str;");
         writer.outdent().println("}");
     }
@@ -676,13 +754,24 @@ public class CTarget implements TeaVMTarget, TeaVMCHost {
 
     private List<String> getGeneratedFiles(ListableClassHolderSource classes, List<? extends ValueType> types) {
         List<String> files = new ArrayList<>();
-        files.add("runtime.c");
+        files.add("callsites.c");
+        files.add("core.c");
+        files.add("date.c");
+        files.add("fiber.c");
+        files.add("file.c");
+        files.add("heapdump.c");
+        files.add("heaptrace.c");
+        files.add("log.c");
+        files.add("memory.c");
+        files.add("references.c");
+        files.add("resource.c");
+        files.add("special.c");
+        files.add("stack.c");
+        files.add("string.c");
         files.add("stringhash.c");
         files.add("strings.c");
-        files.add("callsites.c");
-        files.add("references.c");
-        files.add("date.c");
-        files.add("file.c");
+        files.add("time.c");
+        files.add("virtcall.c");
 
         for (String className : classes.getClassNames()) {
             files.add(ClassGenerator.fileName(className) + ".c");
@@ -693,12 +782,13 @@ public class CTarget implements TeaVMTarget, TeaVMCHost {
 
         files.add("main.c");
 
+        files.sort(String::compareTo);
         return files;
     }
 
     private void generateArrayOfClassReferences(GenerationContext context, CodeWriter writer, IncludeManager includes,
             List<? extends ValueType> types) {
-        writer.print("static TeaVM_Class* teavm_classReferences[" + types.size() + "] = {").indent();
+        writer.print("TeaVM_Class* teavm_classReferences[" + types.size() + "] = {").indent();
         boolean first = true;
         for (ValueType type : types) {
             if (!first) {
@@ -714,35 +804,60 @@ public class CTarget implements TeaVMTarget, TeaVMCHost {
             writer.println();
         }
         writer.outdent().println("};");
+
+        writer.println("int32_t teavm_classReferencesCount = " + types.size() + ";");
     }
 
     private void generateMain(GenerationContext context, CodeWriter writer, IncludeManager includes,
             ListableClassHolderSource classes, List<? extends ValueType> types) {
-        writer.println("int main(int argc, char** argv) {").indent();
+        Iterator<? extends TeaVMEntryPoint> entryPointIter = controller.getEntryPoints().values().iterator();
+        String mainFunctionName = entryPointIter.hasNext() ? entryPointIter.next().getPublicName() : null;
+        if (mainFunctionName == null) {
+            mainFunctionName = "main";
+        }
+
+        ClassGenerationContext classContext = new ClassGenerationContext(context, includes, writer.fragment(),
+                null, null);
+
+        writer.println("int " + mainFunctionName + "(int argc, char** argv) {").indent();
 
         writer.println("teavm_beforeInit();");
-        writer.println("teavm_initHeap(" + minHeapSize + ");");
-        generateVirtualTableHeaders(context, writer, types);
+        writer.println("teavm_initHeap(" + minHeapSize + ", " + maxHeapSize + ");");
+        generateVirtualTableHeaders(context, writer);
         writer.println("teavm_initStringPool();");
         for (ValueType type : types) {
             includes.includeType(type);
             writer.println(context.getNames().forClassSystemInitializer(type) + "();");
         }
         writer.println("teavm_afterInitClasses();");
-        generateStaticInitializerCalls(context, writer, includes, classes);
-        writer.println(context.getNames().forClassInitializer("java.lang.String") + "();");
-        generateFiberStart(context, writer, includes);
+        generateStaticInitializerCalls(classContext, writer, classes);
+        if (context.getClassInitializerInfo().isDynamicInitializer("java.lang.String")) {
+            writer.println(context.getNames().forClassInitializer("java.lang.String") + "();");
+        }
+        generateFiberStart(classContext, writer);
+
+        writer.println("return 0;");
 
         writer.outdent().println("}");
     }
 
-    private void generateStaticInitializerCalls(GenerationContext context, CodeWriter writer, IncludeManager includes,
+    private void generateStaticInitializerCalls(ClassGenerationContext context, CodeWriter writer,
             ListableClassReaderSource classes) {
+        NameProvider names = context.getContext().getNames();
+        Characteristics characteristics = context.getContext().getCharacteristics();
         MethodDescriptor clinitDescriptor = new MethodDescriptor("<clinit>", ValueType.VOID);
+        if (classes.getClassNames().contains(GC.class.getName())) {
+            MethodReference methodRef = new MethodReference(GC.class.getName(), clinitDescriptor);
+            context.importMethod(methodRef, true);
+            writer.println(names.forMethod(methodRef) + "();");
+        }
+
         for (String className : classes.getClassNames()) {
+            if (className.equals(GC.class.getName())) {
+                continue;
+            }
             ClassReader cls = classes.get(className);
-            if (!context.getCharacteristics().isStaticInit(cls.getName())
-                    && !context.getCharacteristics().isStructure(cls.getName())) {
+            if (!characteristics.isStaticInit(cls.getName()) && !characteristics.isStructure(cls.getName())) {
                 continue;
             }
 
@@ -751,39 +866,32 @@ public class CTarget implements TeaVMTarget, TeaVMCHost {
                 continue;
             }
 
-            includes.includeClass(className);
-            String clinitName = context.getNames().forMethod(new MethodReference(className, clinitDescriptor));
-            writer.println(clinitName + "();");
+            MethodReference methodRef = new MethodReference(className, clinitDescriptor);
+            context.importMethod(methodRef, true);
+            writer.println(names.forMethod(methodRef) + "();");
         }
     }
 
-    private void generateVirtualTableHeaders(GenerationContext context, CodeWriter writer,
-            List<? extends ValueType> types) {
-        writer.println("teavm_beforeClasses = (char*) teavm_classReferences[0];");
-        writer.println("for (int i = 1; i < " + types.size() + "; ++i) {").indent();
-        writer.println("char* c = (char*) teavm_classReferences[i];");
-        writer.println("if (c < teavm_beforeClasses) teavm_beforeClasses = c;");
-        writer.outdent().println("}");
-        writer.println("teavm_beforeClasses -= 4096;");
-
-        String classClassName = context.getNames().forClassInstance(ValueType.object("java.lang.Class"));
-        writer.print("int32_t classHeader = TEAVM_PACK_CLASS(&" + classClassName + ") | ");
-        CodeGeneratorUtil.writeIntValue(writer, RuntimeObject.GC_MARKED);
-        writer.println(";");
-
-        writer.println("for (int i = 0; i < " + types.size() + "; ++i) {").indent();
-        writer.println("teavm_classReferences[i]->parent.header = classHeader;");
-        writer.outdent().println("}");
+    private void generateVirtualTableHeaders(GenerationContext context, CodeWriter writer) {
+        writer.println("teavm_classClass = (TeaVM_Class*) &" + context.getNames().forClassInstance(
+                ValueType.object("java.lang.Class")) + ";");
+        writer.println("teavm_objectClass = (TeaVM_Class*) &" + context.getNames().forClassInstance(
+                ValueType.object("java.lang.Object")) + ";");
+        writer.println("teavm_stringClass = (TeaVM_Class*) &" + context.getNames().forClassInstance(
+                ValueType.object("java.lang.String")) + ";");
+        writer.println("teavm_charArrayClass = (TeaVM_Class*) &" + context.getNames().forClassInstance(
+                ValueType.arrayOf(ValueType.CHARACTER)) + ";");
+        writer.println("teavm_initClasses();");
     }
 
-    private void generateFiberStart(GenerationContext context, CodeWriter writer, IncludeManager includes) {
-        String startName = context.getNames().forMethod(new MethodReference(Fiber.class,
-                "startMain", String[].class, void.class));
-        String processName = context.getNames().forMethod(new MethodReference(EventQueue.class, "process", void.class));
-        writer.println(startName + "(teavm_parseArguments(argc, argv));");
-        writer.println(processName + "();");
-        includes.includeClass(Fiber.class.getName());
-        includes.includeClass(EventQueue.class.getName());
+    private void generateFiberStart(ClassGenerationContext context, CodeWriter writer) {
+        NameProvider names = context.getContext().getNames();
+        MethodReference startRef = new MethodReference(Fiber.class, "startMain", String[].class, void.class);
+        MethodReference processRef = new MethodReference(EventQueue.class, "process", void.class);
+        context.importMethod(startRef, true);
+        context.importMethod(processRef, true);
+        writer.println(names.forMethod(startRef) + "(teavm_parseArguments(argc, argv));");
+        writer.println(names.forMethod(processRef) + "();");
     }
 
     class FiberIntrinsic implements Intrinsic {
@@ -808,10 +916,10 @@ public class CTarget implements TeaVMTarget, TeaVMCHost {
                     generateCallToMainMethod(context, invocation);
                     break;
                 case "setCurrentThread":
-                    context.includes().includeClass(Thread.class.getName());
-                    String methodName = context.names().forMethod(new MethodReference(Thread.class,
-                            "setCurrentThread", Thread.class, void.class));
-                    context.writer().print(methodName).print("(");
+                    MethodReference methodRef = new MethodReference(Thread.class,
+                            "setCurrentThread", Thread.class, void.class);
+                    context.importMethod(methodRef, true);
+                    context.writer().print(context.names().forMethod(methodRef)).print("(");
                     context.emit(invocation.getArguments().get(0));
                     context.writer().print(")");
                     break;
@@ -821,9 +929,10 @@ public class CTarget implements TeaVMTarget, TeaVMCHost {
 
     private void generateCallToMainMethod(IntrinsicContext context, InvocationExpr invocation) {
         NameProvider names = context.names();
-        TeaVMEntryPoint entryPoint = controller.getEntryPoints().get("main");
-        if (entryPoint != null) {
-            context.includes().includeClass(entryPoint.getMethod().getClassName());
+        Iterator<? extends TeaVMEntryPoint> entryPointIter = controller.getEntryPoints().values().iterator();
+        if (entryPointIter.hasNext()) {
+            TeaVMEntryPoint entryPoint = entryPointIter.next();
+            context.importMethod(entryPoint.getMethod(), true);
             String mainMethod = names.forMethod(entryPoint.getMethod());
             context.writer().print(mainMethod + "(");
             context.emit(invocation.getArguments().get(0));
@@ -839,5 +948,10 @@ public class CTarget implements TeaVMTarget, TeaVMCHost {
     @Override
     public boolean isAsyncSupported() {
         return true;
+    }
+
+    @Override
+    public InliningFilterFactory getInliningFilter() {
+        return new LowLevelInliningFilterFactory(characteristics);
     }
 }

@@ -29,7 +29,6 @@ import org.teavm.classlib.java.util.TCollection;
 import org.teavm.classlib.java.util.TIterator;
 import org.teavm.interop.Async;
 import org.teavm.interop.AsyncCallback;
-import org.teavm.interop.Sync;
 import org.teavm.platform.Platform;
 import org.teavm.platform.PlatformQueue;
 import org.teavm.platform.PlatformRunnable;
@@ -392,7 +391,6 @@ public class TArrayBlockingQueue<E> extends TAbstractQueue<E> implements TBlocki
         }
     }
 
-    @Sync
     private void addImpl(E e) {
         array[tail++] = e;
         if (tail == array.length) {
@@ -401,7 +399,6 @@ public class TArrayBlockingQueue<E> extends TAbstractQueue<E> implements TBlocki
         notifyChange();
     }
 
-    @Sync
     private E removeImpl() {
         @SuppressWarnings("unchecked")
         E result = (E) array[head];
@@ -417,17 +414,15 @@ public class TArrayBlockingQueue<E> extends TAbstractQueue<E> implements TBlocki
         if (waitHandlers == null) {
             return;
         }
-        if (waitHandlers != null) {
-            while (!waitHandlers.isEmpty()) {
-                WaitHandler handler = waitHandlers.remove();
-                if (PlatformDetector.isLowLevel()) {
-                    EventQueue.offer(handler::changed);
-                } else {
-                    Platform.postpone(handler::changed);
-                }
+        while (!waitHandlers.isEmpty()) {
+            WaitHandler handler = waitHandlers.remove();
+            if (PlatformDetector.isLowLevel()) {
+                EventQueue.offer(handler::changed);
+            } else {
+                Platform.postpone(handler::changed);
             }
-            waitHandlers = null;
         }
+        waitHandlers = null;
     }
 
     @Async

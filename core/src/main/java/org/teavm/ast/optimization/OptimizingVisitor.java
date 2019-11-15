@@ -27,6 +27,7 @@ import org.teavm.ast.AssignmentStatement;
 import org.teavm.ast.BinaryExpr;
 import org.teavm.ast.BinaryOperation;
 import org.teavm.ast.BlockStatement;
+import org.teavm.ast.BoundCheckExpr;
 import org.teavm.ast.BreakStatement;
 import org.teavm.ast.CastExpr;
 import org.teavm.ast.ConditionalExpr;
@@ -69,7 +70,7 @@ class OptimizingVisitor implements StatementVisitor, ExprVisitor {
     Statement resultStmt;
     private final boolean[] preservedVars;
     private final int[] writeFrequencies;
-    private final int[] initialWriteFrequences;
+    private final int[] initialWriteFrequencies;
     private final int[] readFrequencies;
     private final Object[] constants;
     private List<Statement> resultSequence;
@@ -82,7 +83,7 @@ class OptimizingVisitor implements StatementVisitor, ExprVisitor {
             boolean friendlyToDebugger) {
         this.preservedVars = preservedVars;
         this.writeFrequencies = writeFrequencies;
-        this.initialWriteFrequences = writeFrequencies.clone();
+        this.initialWriteFrequencies = writeFrequencies.clone();
         this.readFrequencies = readFrequencies;
         this.constants = constants;
         this.friendlyToDebugger = friendlyToDebugger;
@@ -279,7 +280,7 @@ class OptimizingVisitor implements StatementVisitor, ExprVisitor {
                 return;
             }
 
-            if (!preservedVars[index] && initialWriteFrequences[index] == 1 && constants[index] != null) {
+            if (!preservedVars[index] && initialWriteFrequencies[index] == 1 && constants[index] != null) {
                 ConstantExpr constantExpr = new ConstantExpr();
                 constantExpr.setValue(constants[index]);
                 constantExpr.setLocation(expr.getLocation());
@@ -561,7 +562,7 @@ class OptimizingVisitor implements StatementVisitor, ExprVisitor {
                     left = resultExpr;
                 } else {
                     int varIndex = ((VariableExpr) statement.getLeftValue()).getIndex();
-                    if (!preservedVars[varIndex] && initialWriteFrequences[varIndex] == 1
+                    if (!preservedVars[varIndex] && initialWriteFrequencies[varIndex] == 1
                             && constants[varIndex] != null) {
                         resultStmt = new SequentialStatement();
                         return;
@@ -765,6 +766,9 @@ class OptimizingVisitor implements StatementVisitor, ExprVisitor {
 
     private void normalizeConditional(ConditionalStatement stmt) {
         if (stmt.getConsequent().isEmpty()) {
+            if (stmt.getAlternative().isEmpty()) {
+                return;
+            }
             stmt.getConsequent().addAll(stmt.getAlternative());
             stmt.getAlternative().clear();
             stmt.setCondition(ExprOptimizer.invert(stmt.getCondition()));
@@ -1031,6 +1035,28 @@ class OptimizingVisitor implements StatementVisitor, ExprVisitor {
             statement.getObjectRef().acceptVisitor(this);
             statement.setObjectRef(resultExpr);
             resultStmt = statement;
+        } finally {
+            popLocation();
+        }
+    }
+
+    @Override
+    public void visit(BoundCheckExpr expr) {
+        pushLocation(expr.getLocation());
+        try {
+            expr.getIndex().acceptVisitor(this);
+            Expr index = resultExpr;
+
+            Expr array = null;
+            if (expr.getArray() != null) {
+                expr.getArray().acceptVisitor(this);
+                array = resultExpr;
+            }
+
+            expr.setIndex(index);
+            expr.setArray(array);
+
+            resultExpr = expr;
         } finally {
             popLocation();
         }

@@ -36,14 +36,16 @@ public class ConsoleIntrinsic implements Intrinsic {
     public void apply(IntrinsicContext context, InvocationExpr invocation) {
         switch (invocation.getMethod().getName()) {
             case "printString": {
-                context.includes().addInclude("<stdio.h>");
-                context.writer().print("fprintf(stderr, \"%s\", ");
+                context.includes().includePath("log.h");
+                context.writer().print("teavm_printString(");
                 Expr arg = invocation.getArguments().get(0);
                 String literal = extractStringConstant(arg);
                 if (literal != null) {
+                    context.writer().print("u");
                     StringPoolGenerator.generateSimpleStringLiteral(context.writer(), literal);
                 } else {
-                    context.writer().print("teavm_stringToC(");
+                    context.includes().includePath("string.h");
+                    context.writer().print("teavm_stringToC16(");
                     context.emit(arg);
                     context.writer().print(")");
                 }
